@@ -1,0 +1,14 @@
+{
+  "always": {},
+  "loop": {
+    "example_char_a": {
+      "weight": 0.8,
+      "activation": "character a, long hair"
+    },
+    "example_char_b": {
+      "weight": 0.8,
+      "activation": "character b, short hair"
+    }
+  },
+  "random": {}
+}

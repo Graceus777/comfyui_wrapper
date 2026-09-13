@@ -1,0 +1,8 @@
+{
+  "positive_prompt": "1girl, {pose}, {view}, white background, full body, masterpiece, best quality",
+  "negative_prompt": "low quality, worst quality, bad anatomy, extra limbs, watermark",
+  "slots": {
+    "pose": ["standing", "kneeling"],
+    "view": ["from side", "from behind"]
+  }
+}

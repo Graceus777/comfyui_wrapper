@@ -1,0 +1,35 @@
+# Copy to config.yaml and select filenames returned by `comfywrap models`.
+comfyui:
+  host: 127.0.0.1
+  port: 8188
+  timeout_s: 600
+  poll_interval_s: 0.5
+paths:
+  workflows: workflows
+  zones: configs/zones
+  prompts: configs/prompts
+  jobs: configs/jobs
+  output: outputs
+  history: generation_history.jsonl
+  combinator_root: ""
+  webui_root: ""
+  comfyui_root: ""
+workflow:
+  file: sdxl_txt2img.api.json
+  map: {}
+generation:
+  checkpoint: YOUR_SDXL_CHECKPOINT.safetensors
+  positive: a ceramic teapot on a wooden table, soft window light
+  negative: blurry, watermark
+  steps: 28
+  cfg: 5.0
+  sampler: euler_ancestral
+  scheduler: normal
+  width: 1024
+  height: 1024
+  seed: 42
+  batch_size: 1
+batch:
+  skip_exists: true
+  save_locally: true
+  in_flight: 1

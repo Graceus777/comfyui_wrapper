@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-wrapper"
+version = "0.1.0"
+description = "Config-driven ComfyUI API client with combinator-style batch prep and run"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    "websocket-client>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+web = ["gradio>=4.44.0"]
+
+[project.scripts]
+comfywrap = "comfyui_wrapper.cli:main"
+comfywrap-ui = "comfyui_wrapper.webui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
