@@ -12,6 +12,7 @@ dist/
 build/
 *.bak
 
+# Local configuration and runtime artifacts.
 config.yaml
 *.lnk
 *.log

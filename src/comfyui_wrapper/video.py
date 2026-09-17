@@ -18,8 +18,11 @@ from comfyui_wrapper.h3 import (
     apply_h3_graph,
     apply_h3_latent_upscale,
     coerce_video_stack,
+    normalize_ref_image_size,
     recipe_settings,
     rtx_vsr_graph,
+    set_last_frame,
+    set_r2v_refs,
 )
 from comfyui_wrapper.history import append_history, compute_generation_hash
 from comfyui_wrapper.models import infer_comfyui_root, list_pdd_acc, list_text_encoders, list_unets, list_vaes
@@ -238,6 +241,12 @@ def generate_video(
     prompt: str | None = None,
     *,
     image: str | Path | None = None,
+    last_frame: str | Path | None = None,
+    mode: str | None = None,
+    ref_images: list[str | Path] | None = None,
+    ref_videos: list[str | Path] | None = None,
+    ref_audios: list[str | Path] | None = None,
+    ref_image_size: str | None = None,
     seed: int | None = None,
     steps: int | None = None,
     width: int | None = None,
@@ -264,7 +273,13 @@ def generate_video(
     dump_path: str | Path | None = None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> GenerateResult:
-    """Queue a MiniMax H3 I2V job. Optional cyclic crossfade makes an ambient loop."""
+    """Queue a MiniMax H3 video job: I2V/FLF2V or R2V-lite (FL2VA, no new model).
+
+    R2V-lite reuses the FL2VA UNET with the native
+    ``MiniMaxH3ReferenceToVideo`` node: ``<Picture i>`` / ``<Video k>`` /
+    ``<Audio j>`` tags steer identity, motion, and voice. Reference
+    adherence is weaker than a true Ref2VA checkpoint, but costs zero bytes.
+    """
     if cfg is None:
         if isinstance(config, WrapperConfig):
             cfg = config
@@ -276,9 +291,27 @@ def generate_video(
         used_seed = random.randint(0, 2**32 - 1)
     used_seed = int(used_seed)
 
-    if image is not None and width is None and height is None:
+    ref_img_list = [ref_images] if isinstance(ref_images, (str, Path)) else list(ref_images or [])
+    ref_vid_list = [ref_videos] if isinstance(ref_videos, (str, Path)) else list(ref_videos or [])
+    ref_aud_list = [ref_audios] if isinstance(ref_audios, (str, Path)) else list(ref_audios or [])
+    raw_mode = str(mode if mode is not None else vid.mode or "i2v").strip().lower()
+    if raw_mode in {"r2v", "ref", "reference", "r2v-lite", "r2vlite"}:
+        use_r2v = True
+    elif raw_mode in {"i2v", "flf", "flf2v", "t2v", ""}:
+        use_r2v = bool(ref_img_list or ref_vid_list or ref_aud_list)
+    else:
+        use_r2v = bool(ref_img_list or ref_vid_list or ref_aud_list)
+    # In R2V-lite the first-frame still doubles as <Picture 1> when no refs given.
+    if use_r2v and image is not None and not ref_img_list and not ref_vid_list:
+        ref_img_list = [image]
+        image_for_size = image
+    else:
+        image_for_size = image
+    if not use_r2v and image is None:
+        raise ValueError("I2V mode needs --image <still>; use --mode r2v for prompt-only or reference-driven generation")
+    if image_for_size is not None and width is None and height is None:
         try:
-            width, height = target_dimensions(image, megapixels=vid.size_megapixels)
+            width, height = target_dimensions(image_for_size, megapixels=vid.size_megapixels)
         except Exception:
             width, height = h3_size(vid.width, vid.height, fit=False)
     else:
@@ -320,12 +353,21 @@ def generate_video(
     fade_n = int(crossfade_frames if crossfade_frames is not None else vid.crossfade_frames)
     do_latent = vid.latent_upscale if latent_upscale is None else bool(latent_upscale)
     do_rtx = vid.rtx_vsr if rtx_vsr is None else bool(rtx_vsr)
-    prefix = filename_prefix or "h3_loop"
+    ref_size_n = normalize_ref_image_size(ref_image_size if ref_image_size is not None else vid.ref_image_size)
+    prefix = filename_prefix or ("h3_r2v" if use_r2v else "h3_loop")
     positive = prompt if prompt is not None else (vid.prompt or cfg.generation.positive)
 
-    image_key = client.upload_image(image, "wrapper/h3") if image is not None else None
+    image_key = client.upload_image(image, "wrapper/h3") if image is not None and not use_r2v else None
+    last_key = client.upload_image(last_frame, "wrapper/h3") if last_frame is not None and not use_r2v else None
+    ref_image_keys = [client.upload_image(p, "wrapper/h3/refs") for p in ref_img_list] if use_r2v else []
+    ref_video_keys = (
+        [stage_input_video(p, client=client, cfg=cfg) for p in ref_vid_list] if use_r2v else []
+    )
+    ref_audio_keys = (
+        [stage_input_video(p, client=client, cfg=cfg) for p in ref_aud_list] if use_r2v else []
+    )
 
-    wf = load_workflow(cfg.video_workflow_path())
+    wf = load_workflow(cfg.r2v_workflow_path() if use_r2v else cfg.video_workflow_path())
     settings = {
         "positive": positive,
         "seed": used_seed,
@@ -342,9 +384,20 @@ def generate_video(
         "vae": vae_n,
         "audio_vae": audio_vae_n,
         "image": image_key,
+        "ref_image_size": ref_size_n,
         "filename_prefix": prefix,
     }
     wf = apply_settings(wf, settings, bindings=merge_bindings(wf, cfg.workflow_map))
+    if not use_r2v and last_key:
+        wf = set_last_frame(wf, last_key)
+    if use_r2v:
+        wf = set_r2v_refs(
+            wf,
+            ref_images=ref_image_keys,
+            ref_videos=ref_video_keys,
+            ref_audios=ref_audio_keys,
+            ref_image_size=ref_size_n,
+        )
     wf = apply_h3_graph(
         wf,
         recipe=rec,
@@ -403,9 +456,15 @@ def generate_video(
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "prompt_id": prompt_id,
                 "kind": "video",
+                "mode": "r2v" if use_r2v else ("flf2v" if last_key else "i2v"),
                 "recipe": rec.key,
                 "acc_file": acc_n if rec.acc else "",
                 "steps": steps_n,
+                "ref_images": len(ref_image_keys),
+                "ref_videos": len(ref_video_keys),
+                "ref_audios": len(ref_audio_keys),
+                "ref_image_size": ref_size_n if use_r2v else "",
+                "last_frame": bool(last_key),
                 "latent_upscale": do_latent,
                 "rtx_vsr": do_rtx,
                 "seed": used_seed,

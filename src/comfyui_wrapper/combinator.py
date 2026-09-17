@@ -351,6 +351,7 @@ def prep_jobs(
                     height=gen.height,
                     checkpoint=gen.checkpoint,
                     loras=[r.name for r in refs],
+                    extra={"anima_lllite": gen.anima_lllite},
                 )
                 exists = cfg.batch.skip_exists and (
                     gen_hash in hashes or prefix_has_output(prefix, cfg.paths.output, history)

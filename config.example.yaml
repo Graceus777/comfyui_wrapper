@@ -1,9 +1,12 @@
 # Copy to config.yaml and select filenames returned by `comfywrap models`.
+# Keep local paths and model weights out of Git; config.yaml is ignored.
+
 comfyui:
   host: 127.0.0.1
   port: 8188
   timeout_s: 600
   poll_interval_s: 0.5
+
 paths:
   workflows: workflows
   zones: configs/zones
@@ -11,12 +14,18 @@ paths:
   jobs: configs/jobs
   output: outputs
   history: generation_history.jsonl
+  # Optional: reuse sd-combinator-ext configs and lora_texts as-is.
   combinator_root: ""
+  # Optional A1111 install. Models are linked/referenced in place; never copied.
   webui_root: ""
+  # Optional ComfyUI tree for extra_model_paths.yaml and model links.
   comfyui_root: ""
+
 workflow:
   file: sdxl_txt2img.api.json
+  # Leave empty to auto-detect bindings. Override with node_id.input_name.
   map: {}
+
 generation:
   checkpoint: YOUR_SDXL_CHECKPOINT.safetensors
   positive: a ceramic teapot on a wooden table, soft window light
@@ -29,7 +38,73 @@ generation:
   height: 1024
   seed: 42
   batch_size: 1
+  denoise: 1.0
+  init_image: ""       # local path or existing ComfyUI input key
+  filename_prefix: wrapper
+  loras: []
+  # full = MODEL + CLIP; model_only is useful for Flux-style graphs.
+  lora_mode: full
+  include_lora_tags: false
+
+  # Optional Anima LLLite controls. Items are applied in list order.
+  # `image` may be a preprocessed map, or a raw image when preprocess=canny.
+  anima_lllite: []
+  # anima_lllite:
+  #   - image: C:/path/to/control.png
+  #     model_patch: anima-lllite-depth-1.safetensors
+  #     strength: 1.0
+  #     start_percent: 0.0
+  #     end_percent: 1.0
+  #     preprocess: none
+  #     canny_low: 0.4
+  #     canny_high: 0.8
+
+  hires:
+    enable: false
+    scale: 1.5
+    steps: 0
+    denoise: 0.45
+    upscaler: latent
+  adetailer:
+    enable: false
+    model: ""
+    denoise: 0.4
+    steps: 20
+    cfg: 5.0
+    guide_size: 512
+
 batch:
+  random_count: 1
+  batch_count: 1
+  cooldown_s: 0
   skip_exists: true
+  least_used_first: true
+  sample_random_at: prep
   save_locally: true
   in_flight: 1
+
+video:
+  workflow: minimax_h3_i2v_loop.api.json
+  r2v_workflow: minimax_h3_r2v_loop.api.json
+  mode: i2v                 # i2v or r2v-lite
+  recipe: acc               # native, acc, or acc4 when the weight exists
+  unet: minimax_h3_fl2va_pruned_w4a8_mixed.safetensors
+  clip: qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+  vae: minimax_h3_video_vae_fp16.safetensors
+  audio_vae: minimax_h3_audio_vae_fp32.safetensors
+  acc_file: MiniMax-H3-FL2VA-Acc-8Step.safetensors
+  frames: 124
+  fps: 24
+  steps: 8
+  sampler: euler
+  scheduler: simple
+  shift_video: 12
+  shift_audio: 3
+  width: 832
+  height: 480
+  size_megapixels: 0.52
+  ref_image_size: match    # match or max
+  loop: true
+  crossfade_frames: 12
+  latent_upscale: false
+  rtx_vsr: false

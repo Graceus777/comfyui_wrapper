@@ -4,6 +4,7 @@ from comfyui_wrapper.workflow import (
     detect_bindings,
     hires_target_size,
     inject_adetailer,
+    inject_anima_lllite,
     inject_hires,
     inject_loras,
     is_ui_format,
@@ -104,6 +105,45 @@ def test_inject_loras_model_only(sdxl_wf):
     assert wf["lora_0"]["class_type"] == "LoraLoaderModelOnly"
     assert wf["3"]["inputs"]["model"] == ["lora_0", 0]
     assert wf["6"]["inputs"]["clip"] == ["4", 1]
+
+
+def test_inject_anima_lllite_stacks_and_rewires_sampler(sdxl_wf):
+    wf = inject_anima_lllite(
+        sdxl_wf,
+        [
+            {
+                "image": "control/depth.png",
+                "model_patch": "anima-lllite-depth-1.safetensors",
+                "strength": 0.8,
+                "end_percent": 0.75,
+            },
+            {
+                "image": "control/lineart.png",
+                "model_patch": "anima-lllite-lineart-1.safetensors",
+                "strength": 0.4,
+            },
+        ],
+    )
+    assert wf["anima_model_patch_0"]["inputs"]["name"] == "anima-lllite-depth-1.safetensors"
+    assert wf["anima_lllite_0"]["inputs"]["model"] == ["4", 0]
+    assert wf["anima_lllite_0"]["inputs"]["image"] == ["anima_control_image_0", 0]
+    assert wf["anima_lllite_1"]["inputs"]["model"] == ["anima_lllite_0", 0]
+    assert wf["3"]["inputs"]["model"] == ["anima_lllite_1", 0]
+
+
+def test_inject_anima_lllite_rejects_invalid_schedule(sdxl_wf):
+    import pytest
+
+    with pytest.raises(ValueError, match="0 <= start <= end <= 1"):
+        inject_anima_lllite(
+            sdxl_wf,
+            [{
+                "image": "control.png",
+                "model_patch": "depth.safetensors",
+                "start_percent": 0.9,
+                "end_percent": 0.1,
+            }],
+        )
 
 
 def test_normalize_sampler():

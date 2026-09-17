@@ -309,6 +309,18 @@ def list_pdd_acc(cfg: WrapperConfig | None, client=None) -> list[str]:
     return merge_names(names)
 
 
+def list_model_patches(cfg: WrapperConfig | None, client=None) -> list[str]:
+    """Anima LLLite and other model patches visible to ComfyUI."""
+    names: list[str] = []
+    if client is not None:
+        try:
+            names.extend(client.list_models("model_patches") or [])
+        except Exception:
+            pass
+    names.extend(_disk_models(cfg, "models", "model_patches"))
+    return merge_names(names)
+
+
 def list_loras(cfg: WrapperConfig | None, client=None) -> list[str]:
     return list_kind("loras", cfg, client)
 

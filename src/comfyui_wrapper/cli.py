@@ -24,6 +24,24 @@ from comfyui_wrapper.workflow import load_workflow, merge_bindings
 
 def _cfg(args) -> WrapperConfig:
     cfg = load_config(getattr(args, "config", None))
+    control_image = getattr(args, "anima_control_image", None)
+    control_model = getattr(args, "anima_lllite_model", None)
+    anima_lllite = None
+    if control_image is not None or control_model is not None:
+        if not control_image or not control_model:
+            raise SystemExit(
+                "--anima-control-image and --anima-lllite-model must be supplied together"
+            )
+        anima_lllite = [{
+            "image": control_image,
+            "model_patch": control_model,
+            "strength": getattr(args, "anima_control_strength", 1.0),
+            "start_percent": getattr(args, "anima_control_start_percent", 0.0),
+            "end_percent": getattr(args, "anima_control_end_percent", 1.0),
+            "preprocess": getattr(args, "anima_preprocess", "none") or "none",
+            "canny_low": getattr(args, "anima_canny_low", 0.4),
+            "canny_high": getattr(args, "anima_canny_high", 0.8),
+        }]
     return apply_overrides(
         cfg,
         host=getattr(args, "host", None),
@@ -37,8 +55,11 @@ def _cfg(args) -> WrapperConfig:
         height=getattr(args, "height", None),
         seed=getattr(args, "seed", None),
         batch_size=getattr(args, "batch_size", None),
+        denoise=getattr(args, "denoise", None),
+        init_image=getattr(args, "init_image", None),
         filename_prefix=getattr(args, "prefix", None),
         workflow_file=getattr(args, "workflow", None),
+        anima_lllite=anima_lllite,
         skip_exists=getattr(args, "skip_exists", None),
         random_count=getattr(args, "random_count", None),
         batch_count=getattr(args, "batch_count", None),
@@ -65,7 +86,29 @@ def _add_gen(p: argparse.ArgumentParser) -> None:
     p.add_argument("--height", type=int)
     p.add_argument("--seed", type=int, help="Seed; -1 for random")
     p.add_argument("--batch-size", dest="batch_size", type=int)
+    p.add_argument("--denoise", type=float, help="Denoise 0..1 (img2img strength; 1.0 = txt2img)")
+    p.add_argument(
+        "--init-image",
+        dest="init_image",
+        help="Init image for img2img (local path or ComfyUI input key)",
+    )
     p.add_argument("--prefix", help="SaveImage filename_prefix")
+    p.add_argument("--anima-control-image", help="Preprocessed Anima control map")
+    p.add_argument(
+        "--anima-lllite-model",
+        help="LLLite filename in ComfyUI models/model_patches",
+    )
+    p.add_argument("--anima-control-strength", type=float, default=1.0)
+    p.add_argument("--anima-control-start-percent", type=float, default=0.0)
+    p.add_argument("--anima-control-end-percent", type=float, default=1.0)
+    p.add_argument(
+        "--anima-preprocess",
+        choices=["none", "canny"],
+        default="none",
+        help="A1111-style preprocessor for the control image (none = already preprocessed; canny = raw photo to edges in-graph)",
+    )
+    p.add_argument("--anima-canny-low", type=float, default=0.4)
+    p.add_argument("--anima-canny-high", type=float, default=0.8)
 
 
 def _add_lora_opt(p: argparse.ArgumentParser) -> None:
@@ -349,6 +392,19 @@ def cmd_bindings(args) -> int:
         node = wf.get(nid) or {}
         current = (node.get("inputs") or {}).get(field)
         print(f"  {key:18} -> {nid}.{field}  ({node.get('class_type')})  = {current!r}")
+    if "init_image" not in bindings:
+        from comfyui_wrapper.workflow import nodes_of_type
+
+        has_sampler = bool(nodes_of_type(wf, ["KSampler", "KSamplerAdvanced"]))
+        has_latent = bool(
+            nodes_of_type(wf, ["EmptyLatentImage", "EmptySD3LatentImage", "EmptyHunyuanLatentVideo"])
+        )
+        has_vae = bool(
+            nodes_of_type(wf, ["VAELoader", "CheckpointLoaderSimple", "CheckpointLoader", "VAEDecode"])
+        )
+        if has_sampler and has_latent and has_vae:
+            print("  init_image         -> img2img_loader.image  (LoadImage, injected when --init-image is set)")
+            print("                       img2img_scale.width/height follow Width/Height; KSampler.denoise = strength")
     return 0
 
 
@@ -360,6 +416,12 @@ def cmd_video(args) -> int:
         result = generate_video(
             prompt=args.prompt,
             image=args.image,
+            last_frame=getattr(args, "last_frame", None),
+            mode=getattr(args, "mode", None),
+            ref_images=getattr(args, "ref_image", None),
+            ref_videos=getattr(args, "ref_video", None),
+            ref_audios=getattr(args, "ref_audio", None),
+            ref_image_size=getattr(args, "ref_image_size", None),
             seed=getattr(args, "seed", None),
             steps=getattr(args, "steps", None),
             width=getattr(args, "width", None),
@@ -426,7 +488,18 @@ def build_parser() -> argparse.ArgumentParser:
     vid = sub.add_parser("video", help="MiniMax H3 image-to-video loop (sd-comic-ext ambient graph)")
     _add_global(vid)
     _add_gen(vid)
-    vid.add_argument("--image", required=True, help="First-frame still")
+    vid.add_argument("--image", required=False, default=None, help="First-frame still (I2V/FLF2V; doubles as <Picture 1> in R2V when no --ref-image)")
+    vid.add_argument("--last-frame", dest="last_frame", default=None, help="End still for first+last-frame interpolation (I2V only, FL2VA)")
+    vid.add_argument(
+        "--mode",
+        choices=["i2v", "r2v"],
+        default=None,
+        help="i2v = ImageToVideo (+ optional --last-frame); r2v = ReferenceToVideo lite on FL2VA (auto when any --ref-* is given)",
+    )
+    vid.add_argument("--ref-image", dest="ref_image", action="append", default=[], help="Reference still (<Picture i>, repeatable, max 9)")
+    vid.add_argument("--ref-video", dest="ref_video", action="append", default=[], help="Reference clip, mp4 (<Video k>, repeatable, max 3)")
+    vid.add_argument("--ref-audio", dest="ref_audio", action="append", default=[], help="Reference audio clip (<Audio j>, repeatable, max 3)")
+    vid.add_argument("--ref-image-size", dest="ref_image_size", choices=["match", "max"], default=None)
     vid.add_argument("--prompt", "-p", help="Motion prompt")
     vid.add_argument("--frames", type=int, help="Frame count at 24 fps (124 ≈ 5s)")
     vid.add_argument("--fps", type=int)

@@ -19,7 +19,9 @@ from comfyui_wrapper.workflow import (
     apply_vae_loader,
     dump_workflow,
     inject_adetailer,
+    inject_anima_lllite,
     inject_hires,
+    inject_img2img,
     inject_loras,
     load_workflow,
     merge_bindings,
@@ -100,12 +102,24 @@ def build_workflow(
         "filename_prefix": filename_prefix or gen.filename_prefix,
     }
     wf = apply_settings(wf, settings, bindings=bindings)
+    init_image = str(getattr(gen, "init_image", "") or "").strip()
+    if init_image:
+        wf = inject_img2img(
+            wf,
+            image=init_image,
+            denoise=gen.denoise,
+            width=gen.width,
+            height=gen.height,
+            batch_size=gen.batch_size,
+        )
     if loras:
         wf = inject_loras(
             wf,
             [r.to_dict() for r in loras],
             mode=gen.lora_mode,
         )
+    if gen.anima_lllite:
+        wf = inject_anima_lllite(wf, gen.anima_lllite)
     if gen.hires_enable:
         wf = inject_hires(
             wf,
@@ -145,6 +159,8 @@ def generate(
     sampler: str | None = None,
     scheduler: str | None = None,
     checkpoint: str | None = None,
+    denoise: float | None = None,
+    init_image: str | Path | None = None,
     loras: list | None = None,
     filename_prefix: str | None = None,
     config: WrapperConfig | str | Path | None = None,
@@ -165,6 +181,10 @@ def generate(
             cfg = load_config(config)
     if cfg_scale is not None:
         overrides["cfg"] = cfg_scale
+    if init_image is not None:
+        overrides["init_image"] = str(init_image)
+    if denoise is not None:
+        overrides["denoise"] = denoise
     cfg = apply_overrides(
         cfg,
         steps=steps,
@@ -179,6 +199,43 @@ def generate(
     )
 
     client = client or ComfyClient(cfg=cfg)
+    init_sha: str | None = None
+    init_value = str(getattr(cfg.generation, "init_image", "") or "").strip()
+    if init_value:
+        candidate = Path(init_value)
+        if not candidate.is_absolute():
+            candidate = cfg.paths.root / candidate
+        if candidate.is_file():
+            uploaded = client.upload_image(candidate, "wrapper/img2img")
+            init_sha = _file_sha256(candidate)
+            cfg = apply_overrides(cfg, init_image=uploaded)
+        elif candidate.is_absolute() and not candidate.is_file():
+            raise FileNotFoundError(f"img2img init image not found: {candidate}")
+        # else: assume it is already a ComfyUI input key (e.g. from a previous upload)
+    controls: list[dict] = []
+    for raw in cfg.generation.anima_lllite:
+        if not isinstance(raw, dict):
+            raise ValueError("Each generation.anima_lllite item must be an object")
+        spec = dict(raw)
+        image_value = str(spec.get("image") or "").strip()
+        candidate = Path(image_value)
+        if image_value and not candidate.is_absolute():
+            candidate = cfg.paths.root / candidate
+        if image_value and candidate.is_file():
+            spec["image"] = client.upload_image(candidate, "wrapper/anima_control")
+            spec["source_sha256"] = _file_sha256(candidate)
+        elif candidate.is_absolute() and not candidate.is_file():
+            raise FileNotFoundError(f"Anima control image not found: {candidate}")
+        controls.append(spec)
+    if controls:
+        available_patches = set(client.list_models("model_patches") or [])
+        for spec in controls:
+            model_patch = str(spec.get("model_patch") or spec.get("file") or "").strip()
+            if model_patch not in available_patches:
+                raise ValueError(
+                    f"Anima LLLite model patch {model_patch!r} is missing from model_patches"
+                )
+        cfg = apply_overrides(cfg, anima_lllite=controls)
     share_webui_models(cfg, client)
     if cfg.generation.checkpoint:
         ckpt = ensure_available("checkpoints", cfg.generation.checkpoint, cfg, client)
@@ -225,6 +282,11 @@ def generate(
         height=cfg.generation.height,
         checkpoint=cfg.generation.checkpoint,
         loras=[r.name for r in refs],
+        extra={
+            "anima_lllite": cfg.generation.anima_lllite,
+            "init_image": init_sha or str(getattr(cfg.generation, "init_image", "") or ""),
+            "denoise": cfg.generation.denoise,
+        },
     )
 
     prompt_id = str(uuid.uuid4())
@@ -262,6 +324,16 @@ def generate(
         loras=[r.to_dict() for r in refs],
         gen_hash=gen_hash,
     )
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _save_locally(

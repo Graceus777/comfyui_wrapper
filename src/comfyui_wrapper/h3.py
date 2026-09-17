@@ -23,10 +23,22 @@ SHIFT_VIDEO = 12.0
 SHIFT_AUDIO = 3.0
 ACC_NODE = "MiniMaxH3PDDAccApply"
 SHIFT_NODE = "MiniMaxH3SigmaShift"
+I2V_NODE = "MiniMaxH3ImageToVideo"
+R2V_NODE = "MiniMaxH3ReferenceToVideo"
+GUIDE_NODE = "MiniMaxH3AddGuide"
 ACC_ID = "h3_acc"
 SHIFT_ID = "h3_shift"
 AV_SPLIT_ID = "h3_av_split"
 LATENT_UP_ID = "h3_latent_up"
+LAST_IMAGE_ID = "h3_last_image"
+LAST_SCALE_ID = "h3_last_scale"
+REF_IMAGE_PREFIX = "h3_ref_img_"
+REF_VIDEO_PREFIX = "h3_ref_vid_"
+REF_VC_PREFIX = "h3_ref_vc_"
+REF_AUDIO_PREFIX = "h3_ref_aud_"
+MAX_REF_IMAGES = 9
+MAX_REF_VIDEOS = 3
+MAX_REF_AUDIOS = 3
 DEFAULT_LATENT_UPSCALER = "minimax_h3_latent_upscaler_3d_fp16.safetensors"
 
 DEFAULT_UNET = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
@@ -649,3 +661,146 @@ def rtx_vsr_graph(
             },
         },
     }
+
+
+def has_r2v_node(workflow: dict) -> bool:
+    return _first_id(workflow, [R2V_NODE]) is not None
+
+
+def has_i2v_node(workflow: dict) -> bool:
+    return _first_id(workflow, [I2V_NODE]) is not None
+
+
+def normalize_ref_image_size(raw: Any) -> str:
+    return "max" if str(raw or "").strip().lower() == "max" else "match"
+
+
+def _prune_helper_prefix(workflow: dict, prefix: str, keep: set[str]) -> None:
+    for nid in [k for k in workflow if str(k).startswith(prefix)]:
+        if nid not in keep:
+            workflow.pop(nid, None)
+    # Drop dangling links that pointed at pruned helpers.
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {}
+        for key, value in list(inputs.items()):
+            ref = link_ref(value)
+            if ref and str(ref[0]).startswith(prefix) and ref[0] not in keep:
+                inputs.pop(key, None)
+
+
+def set_last_frame(workflow: dict, image_key: str | None) -> dict:
+    """Wire (or clear) the FLF2V last_frame on the I2V node. No new model."""
+    wf = deepcopy(workflow)
+    i2v = _first_id(wf, [I2V_NODE])
+    if i2v is None:
+        raise ValueError("Graph has no MiniMaxH3ImageToVideo node for last_frame")
+    inputs = wf[i2v].setdefault("inputs", {})
+    if not image_key:
+        inputs.pop("last_frame", None)
+        _prune_helper_prefix(wf, "h3_last_", set())
+        return wf
+    # Mirror the first-frame ImageScale geometry so both keyframes share the canvas.
+    width = inputs.get("width")
+    height = inputs.get("height")
+    for _nid, node in nodes_of_type(wf, ["ImageScale"]):
+        nin = node.get("inputs") or {}
+        width = width if width is not None else nin.get("width")
+        height = height if height is not None else nin.get("height")
+        break
+    wf[LAST_IMAGE_ID] = {
+        "class_type": "LoadImage",
+        "_meta": {"title": "H3 last frame"},
+        "inputs": {"image": image_key},
+    }
+    wf[LAST_SCALE_ID] = {
+        "class_type": "ImageScale",
+        "_meta": {"title": "H3 last frame scale"},
+        "inputs": {
+            "image": [LAST_IMAGE_ID, 0],
+            "upscale_method": "lanczos",
+            "width": int(width) if width is not None else 832,
+            "height": int(height) if height is not None else 480,
+            "crop": "center",
+        },
+    }
+    inputs["last_frame"] = [LAST_SCALE_ID, 0]
+    return wf
+
+
+def set_r2v_refs(
+    workflow: dict,
+    *,
+    ref_images: list[str] | None = None,
+    ref_videos: list[str] | None = None,
+    ref_audios: list[str] | None = None,
+    ref_image_size: str = "match",
+    include_video_audio: bool = True,
+) -> dict:
+    """Wire R2V-lite refs onto the Ref2VA node. Reuses the FL2VA UNET.
+
+    Dotted keys follow the ComfyUI API convention
+    (``ref_images.ref_image_0`` ...). LoadVideo rides through
+    GetVideoComponents so frames feed ``ref_videos`` and the soundtrack
+    auto-pairs to ``ref_video_audios``.
+    """
+    wf = deepcopy(workflow)
+    r2v = _first_id(wf, [R2V_NODE])
+    if r2v is None:
+        raise ValueError("Graph has no MiniMaxH3ReferenceToVideo node for refs")
+    images = [str(x) for x in (ref_images or []) if str(x or "").strip()]
+    videos = [str(x) for x in (ref_videos or []) if str(x or "").strip()]
+    audios = [str(x) for x in (ref_audios or []) if str(x or "").strip()]
+    if len(images) > MAX_REF_IMAGES:
+        raise ValueError(f"At most {MAX_REF_IMAGES} ref_images (got {len(images)})")
+    if len(videos) > MAX_REF_VIDEOS:
+        raise ValueError(f"At most {MAX_REF_VIDEOS} ref_videos (got {len(videos)})")
+    if len(audios) > MAX_REF_AUDIOS:
+        raise ValueError(f"At most {MAX_REF_AUDIOS} ref_audios (got {len(audios)})")
+    inputs = wf[r2v].setdefault("inputs", {})
+    for key in list(inputs):
+        if key.startswith(("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")):
+            inputs.pop(key, None)
+    inputs["ref_image_size"] = normalize_ref_image_size(ref_image_size)
+    keep: set[str] = set()
+    for idx, key in enumerate(images):
+        nid = f"{REF_IMAGE_PREFIX}{idx}"
+        wf[nid] = {
+            "class_type": "LoadImage",
+            "_meta": {"title": f"H3 ref image {idx + 1}"},
+            "inputs": {"image": key},
+        }
+        inputs[f"ref_images.ref_image_{idx}"] = [nid, 0]
+        keep.add(nid)
+    for idx, key in enumerate(videos):
+        vid = f"{REF_VIDEO_PREFIX}{idx}"
+        vc = f"{REF_VC_PREFIX}{idx}"
+        wf[vid] = {
+            "class_type": "LoadVideo",
+            "_meta": {"title": f"H3 ref video {idx + 1}"},
+            "inputs": {"file": key},
+        }
+        wf[vc] = {
+            "class_type": "GetVideoComponents",
+            "_meta": {"title": f"H3 ref video components {idx + 1}"},
+            "inputs": {"video": [vid, 0]},
+        }
+        inputs[f"ref_videos.ref_video_{idx}"] = [vc, 0]
+        if include_video_audio:
+            inputs[f"ref_video_audios.ref_video_audio_{idx}"] = [vc, 1]
+        keep.update({vid, vc})
+    for idx, key in enumerate(audios):
+        nid = f"{REF_AUDIO_PREFIX}{idx}"
+        wf[nid] = {
+            "class_type": "LoadAudio",
+            "_meta": {"title": f"H3 ref audio {idx + 1}"},
+            "inputs": {"audio": key},
+        }
+        inputs[f"ref_audios.ref_audio_{idx}"] = [nid, 0]
+        keep.add(nid)
+    _prune_helper_prefix(wf, REF_IMAGE_PREFIX, keep)
+    _prune_helper_prefix(wf, REF_VIDEO_PREFIX, keep)
+    _prune_helper_prefix(wf, REF_VC_PREFIX, keep)
+    _prune_helper_prefix(wf, REF_AUDIO_PREFIX, keep)
+    return wf

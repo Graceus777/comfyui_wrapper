@@ -9,6 +9,19 @@ def test_parser_subcommands():
     assert args.steps == 20
 
 
+def test_parser_anima_lllite_control():
+    parser = build_parser()
+    args = parser.parse_args([
+        "generate",
+        "--anima-control-image", "depth.png",
+        "--anima-lllite-model", "anima-lllite-depth-1.safetensors",
+        "--anima-control-strength", "0.8",
+    ])
+    assert args.anima_control_image == "depth.png"
+    assert args.anima_lllite_model == "anima-lllite-depth-1.safetensors"
+    assert args.anima_control_strength == 0.8
+
+
 def test_parser_prep_slots():
     parser = build_parser()
     args = parser.parse_args([

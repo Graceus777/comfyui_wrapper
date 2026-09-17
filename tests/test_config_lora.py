@@ -25,6 +25,15 @@ def test_apply_overrides(tmp_path: Path):
     assert cfg.generation.steps == DEFAULTS["generation"]["steps"]
 
 
+def test_anima_lllite_config_and_override(tmp_path: Path):
+    controls = [{"image": "depth.png", "model_patch": "depth.safetensors"}]
+    cfg = from_dict({"generation": {"anima_lllite": controls}}, root=tmp_path)
+    assert cfg.generation.anima_lllite == controls
+    updated = apply_overrides(cfg, anima_lllite=[{"image": "pose.png", "model_patch": "pose.safetensors"}])
+    assert updated.generation.anima_lllite[0]["image"] == "pose.png"
+    assert cfg.generation.anima_lllite[0]["image"] == "depth.png"
+
+
 def test_hires_adetailer_overrides(tmp_path: Path):
     cfg = from_dict({}, root=tmp_path)
     cfg2 = apply_overrides(

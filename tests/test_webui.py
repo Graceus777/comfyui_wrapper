@@ -4,6 +4,7 @@ from comfyui_wrapper.cli import build_parser
 from comfyui_wrapper.config import from_dict
 from comfyui_wrapper.webui import (
     VAE_FROM_CHECKPOINT,
+    anima_lllite_controls,
     filter_choices,
     format_infotext,
     format_progress,
@@ -18,6 +19,38 @@ from comfyui_wrapper.webui import (
     split_csv,
     vae_dropdown_choices,
 )
+
+
+def test_anima_lllite_controls_from_ui_values():
+    assert anima_lllite_controls(False, None, None, 1.0, 0.0, 1.0) == []
+    controls = anima_lllite_controls(
+        True,
+        "C:/maps/depth.png",
+        "anima-lllite-depth-1.safetensors",
+        0.8,
+        0.1,
+        0.9,
+    )
+    assert controls == [{
+        "image": "C:/maps/depth.png",
+        "model_patch": "anima-lllite-depth-1.safetensors",
+        "strength": 0.8,
+        "start_percent": 0.1,
+        "end_percent": 0.9,
+    }]
+
+
+@pytest.mark.parametrize(
+    ("image", "patch", "start", "end"),
+    [
+        (None, "depth.safetensors", 0.0, 1.0),
+        ("depth.png", None, 0.0, 1.0),
+        ("depth.png", "depth.safetensors", 0.8, 0.2),
+    ],
+)
+def test_anima_lllite_controls_reject_incomplete_ui_values(image, patch, start, end):
+    with pytest.raises(ValueError):
+        anima_lllite_controls(True, image, patch, 1.0, start, end)
 
 
 def test_parser_ui_subcommand():
@@ -145,3 +178,12 @@ def test_build_ui_without_comfy(tmp_path):
     cfg = from_dict({"generation": {"positive": "a cat", "steps": 12}}, root=tmp_path)
     demo = build_ui(cfg)
     assert demo is not None
+    ui_config = demo.get_config_file()
+    labels = {
+        component.get("props", {}).get("label")
+        for component in ui_config.get("components", [])
+    }
+    assert "Enable Anima LLLite" in labels
+    assert "Control image (preprocessed map, or raw photo with Canny)" in labels
+    assert "Preprocessor" in labels
+    assert "LLLite model patch" in labels

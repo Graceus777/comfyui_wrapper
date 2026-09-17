@@ -11,6 +11,8 @@ Ways in:
 
 Zone and prompt JSON from [sd-combinator-ext](https://github.com/Graceus777/sd-combinator-ext) load as-is. LoRAs are applied as ComfyUI `LoraLoader` nodes, not as `<lora:...>` tags in the prompt.
 
+For the complete capability inventory, see [FEATURES.md](FEATURES.md).
+
 ## Setup
 
 ComfyUI must already be running (`http://127.0.0.1:8188` by default).
@@ -60,7 +62,7 @@ Opens `http://127.0.0.1:7860`. Same thing via the CLI: `python -m comfyui_wrappe
 | `--no-browser` | Do not open a browser |
 | `--host` / `--comfy-port` | Override the ComfyUI server from `config.yaml` |
 
-- **txt2img** — prompt / negative, sampling, size, seed, batch count, **Hires. fix**, and **ADetailer**. Extra networks cover LoRA (`<lora:name:weight>` → ComfyUI LoRA nodes), textual inversion (`embedding:name` from A1111 `embeddings/`), and hypernetworks. Checkpoints, LoRAs, VAE, embeddings, and ControlNet are used from `paths.webui_root` without copying.
+- **txt2img** — prompt / negative, sampling, size, seed, batch count, **img2img**, **Hires. fix**, **Anima LLLite control**, and **ADetailer**. The img2img section takes an init image (resized to Width x Height, VAE-encoded into the first KSampler; denoise is the strength) and works on SDXL, Anima, Krea 2, and Flux GGUF. The Anima section accepts a preprocessed depth, pose, or lineart image plus a model patch, strength, and timestep schedule. Extra networks cover LoRA (`<lora:name:weight>` → ComfyUI LoRA nodes), textual inversion (`embedding:name` from A1111 `embeddings/`), and hypernetworks. Checkpoints, LoRAs, VAE, embeddings, and ControlNet are used from `paths.webui_root` without copying.
 - **Batch** — combinator zone + prompt config, plus its own steps / CFG / resolution / sampler, and ADetailer. Preview / Prep / Run, or run an existing `configs/jobs/*.json` file.
 - **History** — recent files in `paths.output`.
 
@@ -71,9 +73,12 @@ Generation info is printed in A1111 infotext form (`Steps: …, Sampler: Euler a
 ```powershell
 python -m comfyui_wrapper generate
 python -m comfyui_wrapper generate --prompt "1girl, looking at viewer" --steps 28 --seed 42
-python -m comfyui_wrapper generate --lora example_char_a:0.8 --lora "YOUR_STYLE_LORA:1"
+python -m comfyui_wrapper generate --lora example_char_a:0.8 --lora "example_style:1"
+python -m comfyui_wrapper generate --init-image C:\stills\base.png --denoise 0.6
 python -m comfyui_wrapper generate --dump-workflow patched.json
 ```
+
+img2img (`--init-image` + `--denoise`, or `generation.init_image` in `config.yaml`) injects `LoadImage -> ImageScale -> VAEEncode` ahead of the first KSampler and rewires `latent_image`. The init is resized to the run Width x Height, so it covers SDXL, Anima (`qwen_image_vae`), Krea 2, and Flux GGUF without a separate graph. `bindings` lists it as `init_image -> img2img_loader.image`.
 
 Python:
 
@@ -165,6 +170,27 @@ Pick the workflow in the WebUI; model / CLIP / VAE dropdowns list ComfyUI `check
 
 **Anima** is a split graph (not an SDXL checkpoint): UNET from `models/Stable-diffusion` (hardlinked into ComfyUI `models/diffusion_models`), text encoder `qwen_3_06b_base.safetensors` in `models/text_encoders`, VAE `qwen_image_vae.safetensors` in `models/vae`. CLIPLoader type is `stable_diffusion` so ComfyUI auto-detects the Qwen3 0.6B Anima encoder. WAI-ANIMA defaults: Euler a, CFG 4.5, 28 steps, 1024×1344. Turbo checkpoints want CFG 1 and ~8–12 steps.
 
+Anima LLLite uses ComfyUI's built-in `ModelPatchLoader` and
+`AnimaLLLiteApply` nodes. Put the LLLite weights in `models/model_patches`,
+then pass a preprocessed control image either in `generation.anima_lllite` or
+on the CLI:
+
+```powershell
+python -m comfyui_wrapper generate `
+  --workflow anima_txt2img.api.json `
+  --checkpoint anima_turboV11.safetensors `
+  --steps 8 --cfg-scale 1 --sampler euler --scheduler simple `
+  --anima-control-image C:\maps\p0101-depth.png `
+  --anima-lllite-model anima-lllite-depth-1.safetensors `
+  --anima-control-strength 0.8
+```
+
+`generation.anima_lllite` is a list, so depth, lineart, or pose controls can
+be stacked in order. Each item accepts `image`, `model_patch`, `strength`,
+`start_percent`, and `end_percent`. The wrapper uploads local image paths;
+an existing ComfyUI input key can be supplied instead. Preprocessing is kept
+outside the wrapper so API runs consume the exact saved control map.
+
 To add another graph:
 
 1. In ComfyUI: **File → Export (API)**
@@ -208,9 +234,18 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
+The test suite covers CLI/config parsing, model resolution, workflow binding
+and graph injection, H3 video graph wiring, batch preparation, and WebUI
+construction. A live GPU render still depends on the installed ComfyUI nodes
+and model files; see [FEATURES.md](FEATURES.md) for those operational
+boundaries.
+
 ## First-run checks and recovery
 
-Use an editable installation from this checkout; bundled API graphs remain in `workflows/`. The source-only `requirements.txt` alternative also requires `PYTHONPATH=src` when using `python -m comfyui_wrapper`; `webui.py` adds that path itself.
+Use an editable installation from this checkout; bundled API graphs remain in
+`workflows/`. The source-only `requirements.txt` alternative also requires
+`PYTHONPATH=src` when using `python -m comfyui_wrapper`; the top-level
+`webui.py` launcher adds that path itself.
 
 ```powershell
 comfywrap status
@@ -218,14 +253,24 @@ comfywrap models
 comfywrap bindings
 ```
 
-Replace the checkpoint in `config.yaml` and the placeholder LoRA names in `configs/zones/example.json` with names returned by your server. The example files describe a format; they are not bundled models. Start with SDXL and one image before enabling additional nodes.
+Replace the checkpoint in `config.yaml` and the placeholder LoRA names in
+`configs/zones/example.json` with names returned by your server. Start with
+SDXL and one image before enabling optional nodes. Krea, Anima, Flux GGUF,
+MiniMax H3, Hires, ADetailer, video/audio, latent upscaling, and RTX VSR each
+require their matching model files and ComfyUI node classes.
 
-Krea, Anima, Flux GGUF and MiniMax H3 graphs require the matching model files and node classes on the server. Hires, face detailing, GGUF loading, video/audio, latent upscaling and RTX VSR add their own node dependencies. Inspect a graph's `class_type` values and compare them with ComfyUI's `/object_info`. Selecting a workflow does not install its dependencies. Model and node revisions can change graph compatibility.
+`paths.webui_root` and `paths.comfyui_root` are optional local integration
+settings. When configured, model discovery can update
+`extra_model_paths.yaml` and create model links/junctions; restart ComfyUI
+after changing its model search paths. Leave both blank when managing server
+models yourself or using a remote server.
 
-`paths.webui_root` and `paths.comfyui_root` are optional local integration settings. When configured, model discovery can update `extra_model_paths.yaml` and create model links/junctions; restart ComfyUI after changing its model search paths. Leave both blank when managing server models yourself or using a remote server.
+`prep`/`preview` expand jobs without queueing generation. `batch --resume`
+uses local history; preserve it together with the job file and outputs. If a
+request times out or a process is interrupted, check `status` and server
+history before resubmitting. `interrupt` affects the server's current job and
+does not erase local outputs.
 
-`prep`/`preview` expand jobs without queueing generation. `batch --resume` uses local history; preserve it together with the job file and outputs. If a request times out or a process is interrupted, check `status` and server history before resubmitting. The `interrupt` command interrupts the server's current work, which may belong to another client. It does not erase local outputs.
-
-The still-image `--dump-workflow` option writes the resolved graph as part of generation; it is not a dry-run flag. For graph inspection without generation use `bindings` or inspect the API JSON directly.
-
-The WebUI is optional; CLI-only use needs no Gradio installation. If the UI fails after a Gradio upgrade, capture the traceback and check compatibility before changing an active production environment.
+The WebUI is optional; CLI-only use needs no Gradio installation. The
+`--dump-workflow` option writes the resolved graph as part of generation; use
+`bindings` or inspect the API JSON for graph inspection without queueing work.

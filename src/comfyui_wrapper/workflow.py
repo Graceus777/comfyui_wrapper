@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
@@ -43,7 +44,9 @@ SETTING_KEYS = (
     "length",
     "fps",
     "image",
+    "init_image",
     "audio_vae",
+    "ref_image_size",
 )
 
 # class_type candidates used when walking the graph.
@@ -294,11 +297,25 @@ def detect_bindings(workflow: dict) -> dict[str, tuple[str, str]]:
             set_if_absent("height", nid, "height")
         if "length" in inputs:
             set_if_absent("length", nid, "length")
+        if "ref_image_size" in inputs:
+            set_if_absent("ref_image_size", nid, "ref_image_size")
         break
     for nid, node in nodes_of_type(workflow, ["LoadImage"]):
+        if str(nid).startswith(("h3_ref_", "h3_last_", "anima_control_image", "img2img_")):
+            continue
         if "image" in (node.get("inputs") or {}):
             set_if_absent("image", nid, "image")
             break
+    # img2img init image has its own key so it never clobbers control/video images.
+    if "img2img_loader" in workflow:
+        loader = workflow.get("img2img_loader") or {}
+        if "image" in (loader.get("inputs") or {}):
+            set_if_absent("init_image", "img2img_loader", "image")
+    else:
+        for nid, node in nodes_of_type(workflow, ["LoadImage"]):
+            if str(nid).startswith("img2img_") and "image" in (node.get("inputs") or {}):
+                set_if_absent("init_image", nid, "image")
+                break
     for nid, node in nodes_of_type(workflow, ["CreateVideo"]):
         if "fps" in (node.get("inputs") or {}):
             set_if_absent("fps", nid, "fps")
@@ -384,25 +401,33 @@ def _broadcast_geometry(wf: dict, settings: dict[str, Any]) -> None:
     fps = settings.get("fps")
     image = settings.get("image")
     positive = settings.get("positive")
-    for node in wf.values():
+    ref_image_size = settings.get("ref_image_size")
+    for nid, node in wf.items():
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs")
         if not isinstance(inputs, dict):
             continue
         ctype = node.get("class_type")
-        if width is not None and "width" in inputs:
+        # Ref/last-frame helpers own their own image inputs; the generic
+        # first-frame key must not clobber them. Anima controls and the
+        # img2img init image have their own keys for the same reason.
+        is_helper = str(nid).startswith(("h3_ref_", "h3_last_"))
+        is_owned_image = str(nid).startswith(("anima_control_image", "img2img_"))
+        if width is not None and "width" in inputs and not is_helper:
             inputs["width"] = int(width)
-        if height is not None and "height" in inputs:
+        if height is not None and "height" in inputs and not is_helper:
             inputs["height"] = int(height)
         if length is not None and "length" in inputs and ctype in _VIDEO_CONDITIONING:
             inputs["length"] = int(length)
         if fps is not None and "fps" in inputs and ctype == "CreateVideo":
             inputs["fps"] = float(fps)
-        if image is not None and "image" in inputs and ctype == "LoadImage":
+        if image is not None and "image" in inputs and ctype == "LoadImage" and not is_helper and not is_owned_image:
             inputs["image"] = image
         if positive is not None and "prompt" in inputs and ctype in _VIDEO_CONDITIONING:
             inputs["prompt"] = positive
+        if ref_image_size is not None and "ref_image_size" in inputs and ctype in _VIDEO_CONDITIONING:
+            inputs["ref_image_size"] = ref_image_size
 
 
 def _next_node_id(workflow: dict, prefix: str = "lora") -> str:
@@ -527,6 +552,249 @@ def inject_loras(
             {k: v for k, v in wf.items() if k not in skip}, *clip_src
         )
         rewire_consumers(wf, original_clip_terminal, current_clip, skip_node_ids=skip)
+    return wf
+
+
+ANIMA_PREPROCESSORS = ("none", "canny")
+
+
+def inject_anima_lllite(workflow: dict, controls: list[dict] | None) -> dict:
+    """Chain built-in Anima LLLite model patches onto every sampler model.
+
+    Each control accepts an optional ``preprocess`` step (``none`` = use the
+    image as-is, i.e. already preprocessed; ``canny`` = derive edges in-graph
+    with ComfyUI's built-in Canny node, A1111-preprocessor style, so a raw
+    photo can feed the lineart patch). Canny thresholds use ``canny_low`` /
+    ``canny_high`` (defaults 0.4 / 0.8).
+    """
+    if not controls:
+        return deepcopy(workflow)
+    wf = deepcopy(workflow)
+    samplers = nodes_of_type(wf, _SAMPLER_NODES)
+    if not samplers:
+        raise WorkflowError("Cannot inject Anima LLLite: no KSampler found")
+    current_model = link_ref((samplers[0][1].get("inputs") or {}).get("model"))
+    if current_model is None:
+        raise WorkflowError("Cannot inject Anima LLLite: sampler has no MODEL input")
+    original_model = current_model
+    created: list[str] = []
+
+    for spec in controls:
+        if not isinstance(spec, dict):
+            raise WorkflowError("Each Anima LLLite control must be an object")
+        image = str(spec.get("image") or "").strip()
+        model_patch = str(spec.get("model_patch") or spec.get("file") or "").strip()
+        if not image or not model_patch:
+            raise WorkflowError("Anima LLLite controls require image and model_patch")
+        strength = float(spec.get("strength", 1.0))
+        start_percent = float(spec.get("start_percent", 0.0))
+        end_percent = float(spec.get("end_percent", 1.0))
+        if not all(math.isfinite(value) for value in (strength, start_percent, end_percent)):
+            raise WorkflowError("Anima LLLite strength and schedule must be finite")
+        if not -10.0 <= strength <= 10.0:
+            raise WorkflowError("Anima LLLite strength must be between -10 and 10")
+        if not 0.0 <= start_percent <= end_percent <= 1.0:
+            raise WorkflowError("Anima LLLite schedule must satisfy 0 <= start <= end <= 1")
+        preprocess = str(spec.get("preprocess") or "none").strip().lower()
+        if preprocess not in ANIMA_PREPROCESSORS:
+            raise WorkflowError(
+                f"Unknown Anima preprocess {preprocess!r} (expected one of {list(ANIMA_PREPROCESSORS)})"
+            )
+
+        image_id = _next_node_id(wf, "anima_control_image")
+        wf[image_id] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": image},
+        }
+        created.append(image_id)
+        control_image_ref: list = [image_id, 0]
+        if preprocess == "canny":
+            try:
+                canny_low = float(spec.get("canny_low", 0.4))
+                canny_high = float(spec.get("canny_high", 0.8))
+            except (TypeError, ValueError):
+                raise WorkflowError("Anima Canny thresholds must be numbers")
+            if not all(math.isfinite(v) for v in (canny_low, canny_high)):
+                raise WorkflowError("Anima Canny thresholds must be finite")
+            if not 0.01 <= canny_low < canny_high <= 0.99:
+                raise WorkflowError("Anima Canny thresholds must satisfy 0.01 <= low < high <= 0.99")
+            canny_id = _next_node_id(wf, "anima_canny")
+            wf[canny_id] = {
+                "class_type": "Canny",
+                "_meta": {"title": "Anima Canny preprocess"},
+                "inputs": {
+                    "image": [image_id, 0],
+                    "low_threshold": float(canny_low),
+                    "high_threshold": float(canny_high),
+                },
+            }
+            created.append(canny_id)
+            control_image_ref = [canny_id, 0]
+        patch_id = _next_node_id(wf, "anima_model_patch")
+        wf[patch_id] = {
+            "class_type": "ModelPatchLoader",
+            "inputs": {"name": model_patch},
+        }
+        apply_id = _next_node_id(wf, "anima_lllite")
+        wf[apply_id] = {
+            "class_type": "AnimaLLLiteApply",
+            "inputs": {
+                "model": [current_model[0], current_model[1]],
+                "model_patch": [patch_id, 0],
+                "image": control_image_ref,
+                "strength": strength,
+                "start_percent": start_percent,
+                "end_percent": end_percent,
+            },
+        }
+        created.extend((patch_id, apply_id))
+        current_model = (apply_id, 0)
+
+    rewire_consumers(
+        wf,
+        original_model,
+        current_model,
+        skip_node_ids=set(created),
+    )
+    return wf
+
+
+def inject_img2img(
+    workflow: dict,
+    *,
+    image: str | None,
+    denoise: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    batch_size: int | None = None,
+    upscale_method: str = "lanczos",
+    crop: str = "disabled",
+) -> dict:
+    """Convert a txt2img graph to img2img via LoadImage → ImageScale → VAEEncode.
+
+    Works for SDXL, Anima, Krea2, and Flux GGUF graphs: the VAE is taken from
+    the VAEDecode feeding SaveImage (or the standalone VAELoader), and the
+    first KSampler's ``latent_image`` is rewired to the encoded init image.
+    Idempotent: fixed ``img2img_*`` node ids are reused on repeat calls.
+    """
+    name = str(image or "").strip()
+    if not name:
+        return deepcopy(workflow)
+    if denoise is not None:
+        try:
+            denoise_v = float(denoise)
+        except (TypeError, ValueError):
+            raise WorkflowError(f"img2img denoise must be a number (got {denoise!r})")
+        if not math.isfinite(denoise_v) or not 0.0 < denoise_v <= 1.0:
+            raise WorkflowError("img2img denoise must satisfy 0 < denoise <= 1")
+    else:
+        denoise_v = None
+    wf = deepcopy(workflow)
+    samplers = nodes_of_type(wf, _SAMPLER_NODES)
+    if not samplers:
+        raise WorkflowError("Cannot apply img2img: no KSampler found")
+    sid, snode = samplers[0]
+    s_in = snode.get("inputs") or {}
+    latent_ref = link_ref(s_in.get("latent_image"))
+    latent_node = wf.get(latent_ref[0]) if latent_ref else None
+    latent_inputs = (latent_node.get("inputs") or {}) if isinstance(latent_node, dict) else {}
+
+    target_w = int(width) if width is not None else int(latent_inputs.get("width") or 1024)
+    target_h = int(height) if height is not None else int(latent_inputs.get("height") or 0)
+    if target_h <= 0:
+        # Fall back to whatever ImageScale/EmptyLatent already carries.
+        for _nid, _node in nodes_of_type(wf, list(_LATENT_NODES)):
+            _in = _node.get("inputs") or {}
+            if target_h <= 0 and _in.get("height"):
+                target_h = int(_in["height"])
+            if target_w <= 0 and _in.get("width"):
+                target_w = int(_in["width"])
+    if target_w <= 0 or target_h <= 0:
+        raise WorkflowError("Cannot apply img2img: width/height are unknown")
+    target_batch = int(batch_size) if batch_size is not None else int(latent_inputs.get("batch_size") or 1)
+    target_batch = max(1, target_batch)
+
+    vae_ref: tuple[str, int] | None = None
+    decode_id, _save_id = _find_decode_and_save(wf)
+    if decode_id and decode_id in wf:
+        vae_ref = link_ref(((wf[decode_id].get("inputs") or {}).get("vae")))
+    if vae_ref is None:
+        for nid, node in nodes_of_type(wf, ["VAELoader"]):
+            title = node_title(node).lower()
+            current = str((node.get("inputs") or {}).get("vae_name") or "").lower()
+            if "audio" in title or "audio" in current:
+                continue
+            vae_ref = (nid, 0)
+            break
+    if vae_ref is None:
+        for nid, node in nodes_of_type(wf, ["CheckpointLoaderSimple", "CheckpointLoader"]):
+            vae_ref = (nid, 2)
+            break
+    if vae_ref is None:
+        raise WorkflowError("Cannot apply img2img: no VAE source found")
+
+    wf["img2img_loader"] = {
+        "class_type": "LoadImage",
+        "_meta": {"title": "img2img init image"},
+        "inputs": {"image": name},
+    }
+    wf["img2img_scale"] = {
+        "class_type": "ImageScale",
+        "_meta": {"title": "img2img resize"},
+        "inputs": {
+            "image": ["img2img_loader", 0],
+            "upscale_method": str(upscale_method or "lanczos"),
+            "width": int(target_w),
+            "height": int(target_h),
+            "crop": str(crop or "disabled"),
+        },
+    }
+    wf["img2img_encode"] = {
+        "class_type": "VAEEncode",
+        "_meta": {"title": "img2img VAEEncode"},
+        "inputs": {
+            "pixels": ["img2img_scale", 0],
+            "vae": [vae_ref[0], vae_ref[1]],
+        },
+    }
+    latent_out: list = ["img2img_encode", 0]
+    if target_batch > 1:
+        wf["img2img_repeat"] = {
+            "class_type": "RepeatLatentBatch",
+            "_meta": {"title": "img2img batch"},
+            "inputs": {"samples": ["img2img_encode", 0], "amount": int(target_batch)},
+        }
+        latent_out = ["img2img_repeat", 0]
+    elif "img2img_repeat" in wf:
+        del wf["img2img_repeat"]
+
+    s_in["latent_image"] = latent_out
+    if denoise_v is not None:
+        s_in["denoise"] = float(denoise_v)
+    # Keep the (now unused) EmptyLatent geometry in sync so width/height
+    # bindings and future txt2img runs stay consistent.
+    if isinstance(latent_node, dict) and latent_node.get("class_type") in _LATENT_NODES:
+        latent_inputs["width"] = int(target_w)
+        latent_inputs["height"] = int(target_h)
+        latent_inputs["batch_size"] = int(target_batch)
+    return wf
+
+
+def clear_img2img(workflow: dict) -> dict:
+    """Remove img2img nodes and restore the EmptyLatent feed if possible."""
+    wf = deepcopy(workflow)
+    if not any(str(k).startswith("img2img_") for k in wf):
+        return wf
+    samplers = nodes_of_type(wf, _SAMPLER_NODES)
+    latents = nodes_of_type(wf, list(_LATENT_NODES))
+    if samplers and latents:
+        sid = samplers[0][0]
+        s_in = (wf[sid].get("inputs") or {})
+        current = link_ref(s_in.get("latent_image"))
+        if current and str(current[0]).startswith("img2img_"):
+            s_in["latent_image"] = [latents[0][0], 0]
+    for key in [k for k in list(wf) if str(k).startswith("img2img_")]:
+        del wf[key]
     return wf
 
 

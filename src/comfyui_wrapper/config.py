@@ -47,10 +47,14 @@ DEFAULTS: dict[str, Any] = {
         "seed": -1,
         "batch_size": 1,
         "denoise": 1.0,
+        "init_image": "",
         "filename_prefix": "wrapper",
         "loras": [],
         "lora_mode": "full",
         "include_lora_tags": False,
+        # Optional Anima LLLite controls. Each item requires image and
+        # model_patch; items are chained in list order.
+        "anima_lllite": [],
         "hires": {
             "enable": False,
             "scale": 1.5,
@@ -79,6 +83,8 @@ DEFAULTS: dict[str, Any] = {
     },
     "video": {
         "workflow": "minimax_h3_i2v_loop.api.json",
+        "r2v_workflow": "minimax_h3_r2v_loop.api.json",
+        "mode": "i2v",
         "recipe": "acc",
         "unet": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
         "clip": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
@@ -95,6 +101,7 @@ DEFAULTS: dict[str, Any] = {
         "width": 832,
         "height": 480,
         "size_megapixels": 0.52,
+        "ref_image_size": "match",
         "loop": True,
         "crossfade_frames": 12,
         "latent_upscale": False,
@@ -189,6 +196,7 @@ class GenerationSettings:
     seed: int = -1
     batch_size: int = 1
     denoise: float = 1.0
+    init_image: str = ""
     filename_prefix: str = "wrapper"
     clip: str = ""
     clip2: str = ""
@@ -196,6 +204,7 @@ class GenerationSettings:
     loras: list = field(default_factory=list)
     lora_mode: str = "full"
     include_lora_tags: bool = False
+    anima_lllite: list = field(default_factory=list)
     hires_enable: bool = False
     hires_scale: float = 1.5
     hires_steps: int = 0
@@ -212,6 +221,8 @@ class GenerationSettings:
 @dataclass
 class VideoSettings:
     workflow_file: str = "minimax_h3_i2v_loop.api.json"
+    r2v_workflow_file: str = "minimax_h3_r2v_loop.api.json"
+    mode: str = "i2v"
     recipe: str = "acc"
     unet: str = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
     clip: str = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
@@ -228,6 +239,7 @@ class VideoSettings:
     width: int = 832
     height: int = 480
     size_megapixels: float = 0.52
+    ref_image_size: str = "match"
     loop: bool = True
     crossfade_frames: int = 12
     latent_upscale: bool = False
@@ -265,6 +277,12 @@ class WrapperConfig:
 
     def video_workflow_path(self) -> Path:
         given = Path(self.video.workflow_file)
+        if given.is_absolute() and given.exists():
+            return given
+        return self.paths.workflows / given.name
+
+    def r2v_workflow_path(self) -> Path:
+        given = Path(self.video.r2v_workflow_file)
         if given.is_absolute() and given.exists():
             return given
         return self.paths.workflows / given.name
@@ -335,6 +353,7 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             seed=int(g["seed"]),
             batch_size=int(g["batch_size"]),
             denoise=float(g["denoise"]),
+            init_image=str(g.get("init_image") or ""),
             filename_prefix=str(g.get("filename_prefix") or "wrapper"),
             clip=str(g.get("clip") or ""),
             clip2=str(g.get("clip2") or ""),
@@ -342,6 +361,7 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             loras=list(g.get("loras") or []),
             lora_mode=str(g.get("lora_mode") or "full"),
             include_lora_tags=bool(g.get("include_lora_tags") or False),
+            anima_lllite=list(g.get("anima_lllite") or []),
             hires_enable=bool(hires.get("enable", g.get("hires_enable") or False)),
             hires_scale=float(hires.get("scale") if hires.get("scale") is not None else 1.5),
             hires_steps=int(hires.get("steps") if hires.get("steps") is not None else 0),
@@ -366,6 +386,8 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
         ),
         video=VideoSettings(
             workflow_file=str(v.get("workflow") or "minimax_h3_i2v_loop.api.json"),
+            r2v_workflow_file=str(v.get("r2v_workflow") or "minimax_h3_r2v_loop.api.json"),
+            mode=str(v.get("mode") or "i2v").strip().lower(),
             recipe=normalize_recipe(v.get("recipe") or "acc"),
             unet=str(v.get("unet") or "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"),
             clip=str(v.get("clip") or "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
@@ -397,6 +419,7 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             rtx_vsr_scale=float(v.get("rtx_vsr_scale") if v.get("rtx_vsr_scale") is not None else 2.0),
             rtx_vsr_quality=str(v.get("rtx_vsr_quality") or "ULTRA"),
             prompt=str(v.get("prompt") or ""),
+            ref_image_size=str(v.get("ref_image_size") or "match").strip().lower(),
         ),
     )
 
@@ -426,15 +449,16 @@ def apply_overrides(config: WrapperConfig, **kwargs: Any) -> WrapperConfig:
     gen_keys = {
         "checkpoint", "positive", "negative", "steps", "cfg", "sampler",
         "scheduler", "width", "height", "seed", "batch_size", "denoise",
-        "filename_prefix", "loras", "lora_mode", "include_lora_tags",
-        "clip", "clip2", "vae",
+        "init_image", "filename_prefix", "loras", "lora_mode", "include_lora_tags",
+        "clip", "clip2", "vae", "anima_lllite",
     }
     video_keys = {
         "video_workflow", "video_unet", "video_clip", "video_vae", "video_audio_vae",
         "video_recipe", "video_acc_file", "frames", "fps", "length", "loop",
         "crossfade_frames", "shift_video", "shift_audio", "size_megapixels",
         "latent_upscale", "latent_upscale_model", "latent_upscale_scale",
-        "rtx_vsr", "rtx_vsr_scale", "rtx_vsr_quality",
+        "rtx_vsr", "rtx_vsr_scale", "rtx_vsr_quality", "video_mode", "mode",
+        "r2v_workflow", "video_r2v_workflow", "ref_image_size",
     }
     nested_keys = {
         "hires_enable": ("hires", "enable"),
@@ -469,12 +493,15 @@ def apply_overrides(config: WrapperConfig, **kwargs: Any) -> WrapperConfig:
         elif key in video_keys or key.startswith("video_"):
             field = {
                 "video_workflow": "workflow",
+                "video_r2v_workflow": "r2v_workflow",
+                "r2v_workflow": "r2v_workflow",
                 "video_unet": "unet",
                 "video_clip": "clip",
                 "video_vae": "vae",
                 "video_audio_vae": "audio_vae",
                 "video_recipe": "recipe",
                 "video_acc_file": "acc_file",
+                "video_mode": "mode",
                 "length": "frames",
             }.get(key, key)
             raw.setdefault("video", {})[field] = value

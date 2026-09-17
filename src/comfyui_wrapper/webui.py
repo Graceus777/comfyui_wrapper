@@ -34,6 +34,7 @@ from comfyui_wrapper.models import (
     list_embeddings,
     list_hypernetworks,
     list_loras,
+    list_model_patches,
     list_pdd_acc,
     list_text_encoders,
     list_unets,
@@ -128,6 +129,51 @@ SIZE_PRESETS = [
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VIDEO_SUFFIXES = {".mp4", ".webm"}
 VAE_FROM_CHECKPOINT = "(from checkpoint)"
+
+
+def anima_lllite_controls(
+    enabled: bool,
+    image: str | Path | None,
+    model_patch: str | None,
+    strength: float,
+    start_percent: float,
+    end_percent: float,
+    preprocess: str | None = "none",
+    canny_low: float = 0.4,
+    canny_high: float = 0.8,
+) -> list[dict[str, Any]]:
+    """Build one UI-authored Anima LLLite control with clear validation."""
+    if not enabled:
+        return []
+    image_value = str(image or "").strip()
+    patch_value = str(model_patch or "").strip()
+    if not image_value:
+        raise ValueError("Enable Anima LLLite requires a control image")
+    if not patch_value:
+        raise ValueError("Enable Anima LLLite requires a model patch")
+    start = float(start_percent)
+    end = float(end_percent)
+    if not 0.0 <= start <= end <= 1.0:
+        raise ValueError("Anima LLLite schedule must satisfy 0 <= start <= end <= 1")
+    mode = str(preprocess or "none").strip().lower()
+    if mode not in ("none", "canny"):
+        raise ValueError("Anima preprocessor must be none or canny")
+    spec: dict[str, Any] = {
+        "image": image_value,
+        "model_patch": patch_value,
+        "strength": float(strength),
+        "start_percent": start,
+        "end_percent": end,
+    }
+    if mode != "none":
+        spec["preprocess"] = mode
+    if mode == "canny":
+        low, high = float(canny_low), float(canny_high)
+        if not 0.01 <= low < high <= 0.99:
+            raise ValueError("Canny thresholds must satisfy 0.01 <= low < high <= 0.99")
+        spec["canny_low"] = low
+        spec["canny_high"] = high
+    return [spec]
 
 WORKFLOW_PRESETS = {
     "sdxl_txt2img.api.json": {
@@ -380,6 +426,7 @@ def format_infotext(
     loras: list[dict] | None = None,
     hires: dict | None = None,
     adetailer: dict | None = None,
+    img2img: dict | None = None,
 ) -> str:
     """A1111-style generation info block."""
     lines = [positive or ""]
@@ -408,6 +455,8 @@ def format_infotext(
         )
     if adetailer and adetailer.get("enable"):
         bits.append(f"ADetailer: {adetailer.get('model')}")
+    if img2img and img2img.get("enable"):
+        bits.append(f"img2img: denoise {img2img.get('denoise')}")
     lines.append(", ".join(str(x) for x in bits))
     return "\n".join(lines)
 
@@ -554,6 +603,7 @@ def build_ui(cfg: WrapperConfig):
         hypernets = list_hypernetworks(cfg_now, live)
         upscalers = list_upscalers(cfg_now, live)
         ad_models = list_adetailer_models(cfg_now, live)
+        model_patches = list_model_patches(cfg_now, live)
         samplers = list(DEFAULT_SAMPLERS)
         schedulers = list(DEFAULT_SCHEDULERS)
         status = server_status_text(cfg_now, client)
@@ -582,9 +632,42 @@ def build_ui(cfg: WrapperConfig):
         v_vae = match_choice(vaes, vid.vae, "minimax_h3_video_vae")
         v_audio_vae = match_choice(vaes, vid.audio_vae, "minimax_h3_audio_vae")
         rec, v_steps, v_acc = video_recipe_ui(rec, v_unet, acc_files, vid.acc_file)
+        anima_specs = [item for item in gen.anima_lllite if isinstance(item, dict)]
+        anima_spec = anima_specs[0] if anima_specs else {}
+        anima_image_value = str(anima_spec.get("image") or "").strip()
+        if anima_image_value:
+            image_path = Path(anima_image_value)
+            if not image_path.is_absolute():
+                image_path = cfg_now.paths.root / image_path
+            anima_image_value = str(image_path) if image_path.is_file() else ""
+        anima_model = str(
+            anima_spec.get("model_patch") or anima_spec.get("file") or ""
+        ).strip()
+        if not anima_model:
+            anima_model = match_choice(model_patches, "", "anima-lllite-depth") or (
+                model_patches[0] if model_patches else None
+            )
         ctx["acc_files"] = acc_files
+        init_value = str(getattr(gen, "init_image", "") or "").strip()
+        init_path_value: str | None = None
+        if init_value:
+            init_path = Path(init_value)
+            if not init_path.is_absolute():
+                init_path = cfg_now.paths.root / init_path
+            init_path_value = str(init_path) if init_path.is_file() else None
+        try:
+            init_denoise = float(getattr(gen, "denoise", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            init_denoise = 1.0
+        if not 0.0 < init_denoise <= 1.0:
+            init_denoise = 0.6
+        elif not init_path_value:
+            # txt2img default: keep a useful img2img strength ready.
+            init_denoise = 0.6 if init_denoise >= 1.0 else init_denoise
         return {
             "status": status,
+            "img2img_image": init_path_value,
+            "img2img_denoise": float(init_denoise),
             "checkpoints": checkpoints,
             "checkpoint": gen.checkpoint if gen.checkpoint in checkpoints or gen.checkpoint else (checkpoints[0] if checkpoints else None),
             "clips": clips,
@@ -607,6 +690,16 @@ def build_ui(cfg: WrapperConfig):
                 if cfg_now.generation.adetailer_model in ad_models
                 else (ad_models[0] if ad_models else None)
             ),
+            "anima_enabled": bool(anima_specs),
+            "anima_image": anima_image_value or None,
+            "anima_model_patches": prefer_first(model_patches, anima_model),
+            "anima_model_patch": anima_model,
+            "anima_strength": float(anima_spec.get("strength", 1.0)),
+            "anima_start_percent": float(anima_spec.get("start_percent", 0.0)),
+            "anima_end_percent": float(anima_spec.get("end_percent", 1.0)),
+            "anima_preprocess": str(anima_spec.get("preprocess") or "none").strip().lower(),
+            "anima_canny_low": float(anima_spec.get("canny_low", 0.4)),
+            "anima_canny_high": float(anima_spec.get("canny_high", 0.8)),
             "samplers": sampler_dd,
             "sampler": gen.sampler,
             "schedulers": schedulers,
@@ -865,6 +958,26 @@ def build_ui(cfg: WrapperConfig):
                                     value=cfg.generation.filename_prefix,
                                 )
 
+                        with gr.Accordion("img2img", open=False):
+                            gr.Markdown(
+                                "Drop an init image to rework it instead of txt2img. "
+                                "It is resized to Width × Height (lanczos), VAE-encoded, "
+                                "and fed to the first KSampler. Works on SDXL, Anima, "
+                                "Krea 2, and Flux GGUF. Empty = txt2img."
+                            )
+                            img2img_image = gr.Image(
+                                label="Init image (empty = txt2img)",
+                                type="filepath",
+                                value=initial.get("img2img_image"),
+                            )
+                            img2img_denoise = gr.Slider(
+                                label="Denoise (0.3 light to 0.75 heavy rework)",
+                                minimum=0.0,
+                                maximum=1.0,
+                                step=0.01,
+                                value=float(initial.get("img2img_denoise", 0.6)),
+                            )
+
                         with gr.Accordion("Hires. fix", open=False):
                             hires_enable = gr.Checkbox(
                                 label="Enable hires. fix",
@@ -898,6 +1011,72 @@ def build_ui(cfg: WrapperConfig):
                                     maximum=1.0,
                                     step=0.01,
                                     value=float(cfg.generation.hires_denoise),
+                                )
+
+                        with gr.Accordion("Anima LLLite control", open=True):
+                            gr.Markdown(
+                                "Control image + LLLite patch. Use a preprocessed depth, "
+                                "pose, or lineart map as-is (preprocessor None), or hand "
+                                "a raw photo to Canny for A1111-style edge extraction "
+                                "in-graph (pairs with the lineart patch). The image is "
+                                "uploaded to ComfyUI when you generate."
+                            )
+                            anima_enable = gr.Checkbox(
+                                label="Enable Anima LLLite",
+                                value=bool(initial["anima_enabled"]),
+                            )
+                            anima_image = gr.Image(
+                                label="Control image (preprocessed map, or raw photo with Canny)",
+                                type="filepath",
+                                value=initial["anima_image"],
+                            )
+                            anima_preprocess = gr.Dropdown(
+                                label="Preprocessor",
+                                choices=[("None (already preprocessed)", "none"), ("Canny edges (raw photo)", "canny")],
+                                value=initial.get("anima_preprocess", "none"),
+                            )
+                            with gr.Row():
+                                anima_canny_low = gr.Slider(
+                                    label="Canny low",
+                                    minimum=0.01,
+                                    maximum=0.99,
+                                    step=0.01,
+                                    value=float(initial.get("anima_canny_low", 0.4)),
+                                )
+                                anima_canny_high = gr.Slider(
+                                    label="Canny high",
+                                    minimum=0.01,
+                                    maximum=0.99,
+                                    step=0.01,
+                                    value=float(initial.get("anima_canny_high", 0.8)),
+                                )
+                            anima_model_patch = gr.Dropdown(
+                                label="LLLite model patch",
+                                choices=initial["anima_model_patches"],
+                                value=initial["anima_model_patch"],
+                                allow_custom_value=True,
+                            )
+                            with gr.Row():
+                                anima_strength = gr.Slider(
+                                    label="Strength",
+                                    minimum=-2.0,
+                                    maximum=2.0,
+                                    step=0.05,
+                                    value=float(initial["anima_strength"]),
+                                )
+                                anima_start = gr.Slider(
+                                    label="Start percent",
+                                    minimum=0.0,
+                                    maximum=1.0,
+                                    step=0.01,
+                                    value=float(initial["anima_start_percent"]),
+                                )
+                                anima_end = gr.Slider(
+                                    label="End percent",
+                                    minimum=0.0,
+                                    maximum=1.0,
+                                    step=0.01,
+                                    value=float(initial["anima_end_percent"]),
                                 )
 
                         with gr.Accordion("ADetailer", open=False):
@@ -962,11 +1141,29 @@ def build_ui(cfg: WrapperConfig):
                     "Acc uses `MiniMaxH3PDDAccApply` (not Load LoRA) with euler + Acc sigmas. "
                     "**Size from image** keeps the still's aspect on H3's 32px grid "
                     "(1024×1280 → 640×800) and writes that size to both `ImageScale` and "
-                    "the H3 latent. 3D latent upscaler is decode-only 2x; RTX VSR is a post pass."
+                    "the H3 latent. 3D latent upscaler is decode-only 2x; RTX VSR is a post pass. "
+                    "**R2V-lite** reuses your FL2VA UNET with the native `MiniMaxH3ReferenceToVideo` node "
+                    "(`<Picture i>` / `<Video k>` / `<Audio j>`); weaker refs than true Ref2VA, zero new models. "
+                    "I2V accepts an optional last frame for first+last-frame interpolation."
                 )
                 with gr.Row():
                     with gr.Column(scale=5):
-                        v_image = gr.Image(label="First frame", type="filepath")
+                        with gr.Row():
+                            v_mode = gr.Dropdown(
+                                label="Mode",
+                                choices=[("Image-to-video", "i2v"), ("Reference-lite (FL2VA)", "r2v")],
+                                value="i2v",
+                            )
+                            v_ref_size = gr.Dropdown(
+                                label="Ref size",
+                                choices=["match", "max"],
+                                value=str(getattr(cfg.video, "ref_image_size", "match") or "match"),
+                            )
+                        v_image = gr.Image(label="First frame (I2V; doubles as <Picture 1> in R2V)", type="filepath")
+                        v_last = gr.Image(label="Last frame (optional FLF2V, I2V only)", type="filepath")
+                        v_ref_images = gr.File(label="Ref stills (<Picture i>, max 9)", file_count="multiple", file_types=["image"])
+                        v_ref_video = gr.File(label="Ref clip (<Video k>, mp4, max 3)", file_count="multiple", file_types=["video"])
+                        v_ref_audio = gr.File(label="Ref audio (<Audio j>, max 3)", file_count="multiple", file_types=["audio"])
                         v_prompt = gr.Textbox(
                             label="Motion prompt",
                             lines=6,
@@ -1223,6 +1420,10 @@ def build_ui(cfg: WrapperConfig):
                 gr.update(choices=opt["schedulers"], value=opt["scheduler"]),
                 gr.update(choices=opt["upscalers"], value=opt["upscaler"]),
                 gr.update(choices=opt["ad_models"], value=opt["ad_model"]),
+                gr.update(
+                    choices=opt["anima_model_patches"],
+                    value=opt["anima_model_patch"],
+                ),
                 gr.update(choices=opt["zones"], value=opt["zone"]),
                 gr.update(choices=opt["prompts"], value=opt["prompt_config"]),
                 gr.update(choices=opt["jobs"], value=opt["job_file"]),
@@ -1244,7 +1445,8 @@ def build_ui(cfg: WrapperConfig):
             refresh_all,
             outputs=[
                 status_md, checkpoint, workflow, clip, clip2, vae, lora_pick, emb_pick, hn_pick,
-                sampler, scheduler, hires_upscaler, ad_model, zone, prompt_config, job_file,
+                sampler, scheduler, hires_upscaler, ad_model, anima_model_patch,
+                zone, prompt_config, job_file,
                 b_sampler, b_scheduler, b_ad_model, v_unet, v_clip, v_vae, v_audio_vae,
                 v_recipe, v_acc, v_steps, v_latent_up, v_rtx,
             ],
@@ -1297,7 +1499,10 @@ def build_ui(cfg: WrapperConfig):
             prompt_s, negative_s, checkpoint_s, clip_s, clip2_s, vae_s, workflow_s, sampler_s, scheduler_s,
             steps_v, width_v, height_v, cfg_v, batch_count_v, batch_size_v,
             seed_v, denoise_v, prefix_s,
+            img2img_img, img2img_dn,
             hires_on, hires_up, hires_sc, hires_st, hires_dn,
+            anima_on, anima_img, anima_pre, anima_c_low, anima_c_high,
+            anima_patch, anima_weight, anima_start_v, anima_end_v,
             ad_on, ad_mod, ad_st, ad_cf, ad_dn,
         ):
             if not ctx["busy"].acquire(blocking=False):
@@ -1318,6 +1523,25 @@ def build_ui(cfg: WrapperConfig):
                     count = max(1, int(batch_count_v or 1))
                     seed_i = int(seed_v) if seed_v is not None else -1
                     resolver = LoRAResolver.from_client(client, cfg=ctx["cfg"])
+                    anima_controls = anima_lllite_controls(
+                        bool(anima_on),
+                        anima_img,
+                        anima_patch,
+                        float(anima_weight),
+                        float(anima_start_v),
+                        float(anima_end_v),
+                        anima_pre,
+                        float(anima_c_low),
+                        float(anima_c_high),
+                    )
+                    init_path = str(img2img_img or "").strip()
+                    use_img2img = bool(init_path)
+                    try:
+                        eff_denoise = float(img2img_dn) if use_img2img else float(denoise_v)
+                    except (TypeError, ValueError):
+                        raise ValueError("Denoise must be a number")
+                    if use_img2img and not 0.0 < eff_denoise <= 1.0:
+                        raise ValueError("img2img Denoise must satisfy 0 < denoise <= 1")
                     for i in range(count):
                         if ctx["stop"].is_set():
                             result_q.put(("status", "Stopped"))
@@ -1337,7 +1561,8 @@ def build_ui(cfg: WrapperConfig):
                             height=int(height_v),
                             cfg=float(cfg_v),
                             batch_size=int(batch_size_v),
-                            denoise=float(denoise_v),
+                            denoise=float(eff_denoise),
+                            init_image=init_path if use_img2img else "",
                             filename_prefix=prefix_s or None,
                             seed=this_seed,
                             save_locally=True,
@@ -1346,6 +1571,7 @@ def build_ui(cfg: WrapperConfig):
                             hires_scale=float(hires_sc),
                             hires_steps=int(hires_st),
                             hires_denoise=float(hires_dn),
+                            anima_lllite=anima_controls,
                             adetailer_enable=bool(ad_on),
                             adetailer_model=ad_mod or "",
                             adetailer_steps=int(ad_st),
@@ -1390,9 +1616,25 @@ def build_ui(cfg: WrapperConfig):
                                 "denoise": hires_dn,
                             },
                             adetailer={"enable": bool(ad_on), "model": ad_mod},
+                            img2img={"enable": bool(use_img2img), "denoise": eff_denoise},
                         )
                         if count > 1 and seed_i < 0:
                             info += f"\nBatch {i + 1}/{count}"
+                        if use_img2img:
+                            info += f"\nimg2img: {Path(init_path).name}, denoise {eff_denoise}"
+                        if anima_controls:
+                            control = anima_controls[0]
+                            pre = str(control.get("preprocess") or "none")
+                            pre_note = (
+                                f", Canny {control.get('canny_low')}-{control.get('canny_high')}"
+                                if pre == "canny" else ", preprocessed map"
+                            )
+                            info += (
+                                f"\nAnima LLLite: {control['model_patch']}, "
+                                f"Weight: {control['strength']}, "
+                                f"Schedule: {control['start_percent']}-{control['end_percent']}"
+                                f"{pre_note}"
+                            )
                         result_q.put(("partial", (list(images), info, used_seed)))
                     result_q.put(("done", (list(images), info, used_seed)))
                 except Exception as exc:
@@ -1424,7 +1666,10 @@ def build_ui(cfg: WrapperConfig):
             prompt, negative, checkpoint, clip, clip2, vae, workflow, sampler, scheduler,
             steps, width, height, cfg_scale, batch_count, batch_size,
             seed, denoise, prefix,
+            img2img_image, img2img_denoise,
             hires_enable, hires_upscaler, hires_scale, hires_steps, hires_denoise,
+            anima_enable, anima_image, anima_preprocess, anima_canny_low, anima_canny_high,
+            anima_model_patch, anima_strength, anima_start, anima_end,
             ad_enable, ad_model, ad_steps, ad_cfg, ad_denoise,
         ]
         txt2img_outputs = [gallery, gen_status, infotext, last_seed]
@@ -1456,20 +1701,36 @@ def build_ui(cfg: WrapperConfig):
             outputs=[checkpoint, clip, clip2, vae, steps, cfg_scale, sampler, scheduler, width, height],
         )
 
-        def run_video(image_path, prompt_s, width_v, height_v, auto_size, frames_v, steps_v, seed_v, unet_s, clip_s, vae_s, audio_vae_s, recipe_s, acc_s, loop_on, latent_on, rtx_on):
+        def run_video(image_path, last_path, ref_img_files, ref_vid_files, ref_aud_files, mode_s, ref_size_s, prompt_s, width_v, height_v, auto_size, frames_v, steps_v, seed_v, unet_s, clip_s, vae_s, audio_vae_s, recipe_s, acc_s, loop_on, latent_on, rtx_on):
             if not ctx["busy"].acquire(blocking=False):
                 yield None, "Already running"
                 return
             ctx["stop"].clear()
             result_q: queue.Queue = queue.Queue()
 
+            def _paths(files):
+                if not files:
+                    return []
+                if isinstance(files, (str, Path)):
+                    return [str(files)]
+                return [str(getattr(f, "name", f)) for f in files if str(getattr(f, "name", f) or "").strip()]
+
             def worker():
                 try:
-                    if not image_path:
+                    is_r2v = str(mode_s or "i2v").lower() == "r2v"
+                    ref_imgs = _paths(ref_img_files)
+                    ref_vids = _paths(ref_vid_files)
+                    ref_auds = _paths(ref_aud_files)
+                    if is_r2v and image_path and not ref_imgs and not ref_vids:
+                        ref_imgs = [str(image_path)]
+                    if not is_r2v and not image_path:
                         raise ValueError("Upload a first-frame still")
+                    if is_r2v and not image_path and not ref_imgs and not ref_vids and not (prompt_s or "").strip():
+                        raise ValueError("R2V needs a prompt or at least one reference")
                     mp = ctx["cfg"].video.size_megapixels
-                    if auto_size:
-                        w, h = target_dimensions(image_path, megapixels=mp)
+                    size_src = image_path or (ref_imgs[0] if ref_imgs else None)
+                    if auto_size and size_src:
+                        w, h = target_dimensions(size_src, megapixels=mp)
                     else:
                         w, h = h3_size(width_v or 0, height_v or 0, fit=False)
                     client = live_client()
@@ -1479,10 +1740,16 @@ def build_ui(cfg: WrapperConfig):
                     def on_progress(msg):
                         result_q.put(("status", format_progress(msg)))
 
-                    result_q.put(("status", f"Queueing MiniMax H3 I2V at {w}×{h}..."))
+                    result_q.put(("status", f"Queueing MiniMax H3 {'R2V-lite' if is_r2v else 'I2V'} at {w}×{h}..."))
                     result = generate_video(
                         prompt_s,
-                        image=image_path,
+                        image=None if is_r2v else image_path,
+                        last_frame=None if is_r2v else last_path,
+                        mode="r2v" if is_r2v else "i2v",
+                        ref_images=ref_imgs if is_r2v else None,
+                        ref_videos=ref_vids if is_r2v else None,
+                        ref_audios=ref_auds if is_r2v else None,
+                        ref_image_size=ref_size_s if is_r2v else None,
                         seed=int(seed_v) if seed_v is not None else -1,
                         steps=int(steps_v),
                         width=w,
@@ -1578,7 +1845,8 @@ def build_ui(cfg: WrapperConfig):
         v_generate.click(
             run_video,
             inputs=[
-                v_image, v_prompt, v_width, v_height, v_auto_size, v_frames, v_steps, v_seed,
+                v_image, v_last, v_ref_images, v_ref_video, v_ref_audio, v_mode, v_ref_size,
+                v_prompt, v_width, v_height, v_auto_size, v_frames, v_steps, v_seed,
                 v_unet, v_clip, v_vae, v_audio_vae, v_recipe, v_acc, v_loop, v_latent_up, v_rtx,
             ],
             outputs=[v_video, v_status],
