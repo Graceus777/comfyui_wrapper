@@ -20,3 +20,7 @@ config.yaml
 *.safetensors
 *.ckpt
 *.gguf
+
+# Isolated local voice-cloning runtime and downloaded model package.
+.local/tts/
+models/tts/

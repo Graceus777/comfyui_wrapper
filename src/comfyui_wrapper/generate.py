@@ -22,6 +22,7 @@ from comfyui_wrapper.workflow import (
     inject_anima_lllite,
     inject_hires,
     inject_img2img,
+    inject_inpaint,
     inject_loras,
     load_workflow,
     merge_bindings,
@@ -102,16 +103,33 @@ def build_workflow(
         "filename_prefix": filename_prefix or gen.filename_prefix,
     }
     wf = apply_settings(wf, settings, bindings=bindings)
-    init_image = str(getattr(gen, "init_image", "") or "").strip()
-    if init_image:
-        wf = inject_img2img(
+    inpaint_enable = bool(getattr(gen, "inpaint_enable", False))
+    inpaint_image = str(getattr(gen, "inpaint_image", "") or "").strip()
+    inpaint_mask = str(getattr(gen, "inpaint_mask", "") or "").strip()
+    if inpaint_enable:
+        wf = inject_inpaint(
             wf,
-            image=init_image,
-            denoise=gen.denoise,
+            image=inpaint_image or str(getattr(gen, "init_image", "") or "").strip(),
+            mask=inpaint_mask,
+            denoise=getattr(gen, "inpaint_denoise", gen.denoise),
             width=gen.width,
             height=gen.height,
             batch_size=gen.batch_size,
+            grow=getattr(gen, "inpaint_grow", 0),
+            blur=getattr(gen, "inpaint_blur", 0),
+            invert=bool(getattr(gen, "inpaint_invert", False)),
         )
+    else:
+        init_image = str(getattr(gen, "init_image", "") or "").strip()
+        if init_image:
+            wf = inject_img2img(
+                wf,
+                image=init_image,
+                denoise=gen.denoise,
+                width=gen.width,
+                height=gen.height,
+                batch_size=gen.batch_size,
+            )
     if loras:
         wf = inject_loras(
             wf,
@@ -200,18 +218,42 @@ def generate(
 
     client = client or ComfyClient(cfg=cfg)
     init_sha: str | None = None
-    init_value = str(getattr(cfg.generation, "init_image", "") or "").strip()
-    if init_value:
-        candidate = Path(init_value)
+    inpaint_image_sha: str | None = None
+    inpaint_mask_sha: str | None = None
+
+    def _upload_local(value: str, subfolder: str, label: str) -> tuple[str, str | None]:
+        candidate = Path(value)
         if not candidate.is_absolute():
             candidate = cfg.paths.root / candidate
         if candidate.is_file():
-            uploaded = client.upload_image(candidate, "wrapper/img2img")
-            init_sha = _file_sha256(candidate)
-            cfg = apply_overrides(cfg, init_image=uploaded)
-        elif candidate.is_absolute() and not candidate.is_file():
-            raise FileNotFoundError(f"img2img init image not found: {candidate}")
+            uploaded = client.upload_image(candidate, subfolder)
+            return uploaded, _file_sha256(candidate)
+        if candidate.is_absolute() and not candidate.is_file():
+            raise FileNotFoundError(f"{label} not found: {candidate}")
         # else: assume it is already a ComfyUI input key (e.g. from a previous upload)
+        return value, None
+
+    init_value = str(getattr(cfg.generation, "init_image", "") or "").strip()
+    if init_value:
+        uploaded, sha = _upload_local(init_value, "wrapper/img2img", "img2img init image")
+        if sha is not None:
+            init_sha = sha
+            cfg = apply_overrides(cfg, init_image=uploaded)
+    if bool(getattr(cfg.generation, "inpaint_enable", False)):
+        inpaint_image_value = str(getattr(cfg.generation, "inpaint_image", "") or "").strip()
+        inpaint_mask_value = str(getattr(cfg.generation, "inpaint_mask", "") or "").strip()
+        # Inpaint init falls back to the (possibly uploaded) img2img init.
+        if not inpaint_image_value:
+            inpaint_image_value = str(getattr(cfg.generation, "init_image", "") or "").strip()
+        if not inpaint_image_value:
+            raise ValueError("inpaint requires an init image (inpaint_image or init_image)")
+        if not inpaint_mask_value:
+            raise ValueError("inpaint requires a mask image (draw a mask first)")
+        uploaded_image, image_sha = _upload_local(inpaint_image_value, "wrapper/inpaint", "inpaint init image")
+        uploaded_mask, mask_sha = _upload_local(inpaint_mask_value, "wrapper/inpaint", "inpaint mask image")
+        inpaint_image_sha = image_sha
+        inpaint_mask_sha = mask_sha
+        cfg = apply_overrides(cfg, inpaint_image=uploaded_image, inpaint_mask=uploaded_mask)
     controls: list[dict] = []
     for raw in cfg.generation.anima_lllite:
         if not isinstance(raw, dict):
@@ -286,6 +328,15 @@ def generate(
             "anima_lllite": cfg.generation.anima_lllite,
             "init_image": init_sha or str(getattr(cfg.generation, "init_image", "") or ""),
             "denoise": cfg.generation.denoise,
+            "inpaint_enable": bool(getattr(cfg.generation, "inpaint_enable", False)),
+            "inpaint_image": inpaint_image_sha
+            or str(getattr(cfg.generation, "inpaint_image", "") or ""),
+            "inpaint_mask": inpaint_mask_sha
+            or str(getattr(cfg.generation, "inpaint_mask", "") or ""),
+            "inpaint_denoise": getattr(cfg.generation, "inpaint_denoise", None),
+            "inpaint_grow": getattr(cfg.generation, "inpaint_grow", 0),
+            "inpaint_blur": getattr(cfg.generation, "inpaint_blur", 0),
+            "inpaint_invert": bool(getattr(cfg.generation, "inpaint_invert", False)),
         },
     )
 

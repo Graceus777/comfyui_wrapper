@@ -1,0 +1,18 @@
+# dots.tts 0.3.1 inference dependencies; CUDA torch/torchaudio are installed separately.
+# Optional WeTextProcessing/Pynini normalization has no native Windows wheel.
+transformers==4.57.0
+huggingface-hub>=0.34,<1
+loguru
+langcodes[data]
+# The wrapper supplies its own Gradio UI; the worker does not import the upstream GUI.
+einops
+librosa==0.11.0
+soundfile==0.13.1
+numpy==2.2.6
+pydantic==2.12.5
+PyYAML==6.0.3
+safetensors==0.8.0rc0
+torchdiffeq
+tqdm
+lingua-language-detector
+websocket-client>=1.6

@@ -18,7 +18,7 @@ def _r2v(repo_root):
     return load_workflow(repo_root / "workflows" / "minimax_h3_r2v_loop.api.json")
 
 
-def test_r2v_workflow_is_fl2va_lite(repo_root):
+def test_r2v_workflow_uses_dedicated_ref2va_base(repo_root):
     wf = _r2v(repo_root)
     r2v = wf["6"]
     assert r2v["class_type"] == "MiniMaxH3ReferenceToVideo"
@@ -26,8 +26,7 @@ def test_r2v_workflow_is_fl2va_lite(repo_root):
     assert r2v["inputs"]["vae"] == ["3", 0]
     assert r2v["inputs"]["audio_vae"] == ["15", 0]
     assert r2v["inputs"]["ref_image_size"] == "match"
-    assert "fl2va" in wf["1"]["inputs"]["unet_name"]
-    assert "ref2va" not in wf["1"]["inputs"]["unet_name"]
+    assert wf["1"]["inputs"]["unet_name"] == "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
     assert wf["7"]["inputs"] == {"model": ["16", 0], "conditioning": ["6", 0]}
     assert wf["11"]["inputs"]["latent_image"] == ["6", 1]
     b = detect_bindings(wf)

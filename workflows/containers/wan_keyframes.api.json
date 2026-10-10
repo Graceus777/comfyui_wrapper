@@ -1,0 +1,301 @@
+{
+  "high": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "UNETLoader"
+    }
+  },
+  "low": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "UNETLoader"
+    }
+  },
+  "high_lora": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "high",
+        0
+      ],
+      "lora_name": "Wan2_2_I2V_AniSora_3_2_HIGH_rank_64_fp16.safetensors",
+      "strength_model": 1.0
+    },
+    "_meta": {
+      "title": "LoraLoaderModelOnly"
+    }
+  },
+  "low_lora": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "low",
+        0
+      ],
+      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+      "strength_model": 1.0
+    },
+    "_meta": {
+      "title": "LoraLoaderModelOnly"
+    }
+  },
+  "high_shift": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "high_lora",
+        0
+      ],
+      "shift": 5.0
+    },
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "low_shift": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "low_lora",
+        0
+      ],
+      "shift": 5.0
+    },
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "clip": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "CLIPLoader"
+    }
+  },
+  "vae": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "negative": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "clip",
+        0
+      ],
+      "text": "blurry, distorted, subtitles, watermark, static shot"
+    },
+    "_meta": {
+      "title": "CLIPTextEncode"
+    }
+  },
+  "keyframe_0": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "first.png"
+    },
+    "_meta": {
+      "title": "Keyframe 1"
+    }
+  },
+  "keyframe_1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "last.png"
+    },
+    "_meta": {
+      "title": "Keyframe 2"
+    }
+  },
+  "pair_0_text": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "clip",
+        0
+      ],
+      "text": "Smooth continuous motion between the keyframes."
+    },
+    "_meta": {
+      "title": "CLIPTextEncode"
+    }
+  },
+  "pair_0_encode": {
+    "class_type": "WanFirstLastFrameToVideo",
+    "inputs": {
+      "positive": [
+        "pair_0_text",
+        0
+      ],
+      "negative": [
+        "negative",
+        0
+      ],
+      "vae": [
+        "vae",
+        0
+      ],
+      "width": 832,
+      "height": 480,
+      "length": 37,
+      "batch_size": 1,
+      "start_image": [
+        "keyframe_0",
+        0
+      ],
+      "end_image": [
+        "keyframe_1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "WanFirstLastFrameToVideo"
+    }
+  },
+  "pair_0_high": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "high_shift",
+        0
+      ],
+      "latent_image": [
+        "pair_0_encode",
+        2
+      ],
+      "noise_seed": 0,
+      "add_noise": "enable",
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable",
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "pair_0_encode",
+        0
+      ],
+      "negative": [
+        "pair_0_encode",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "KSamplerAdvanced"
+    }
+  },
+  "pair_0_low": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "low_shift",
+        0
+      ],
+      "latent_image": [
+        "pair_0_high",
+        0
+      ],
+      "noise_seed": 0,
+      "add_noise": "disable",
+      "start_at_step": 2,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "pair_0_encode",
+        0
+      ],
+      "negative": [
+        "pair_0_encode",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "KSamplerAdvanced"
+    }
+  },
+  "pair_0_decode": {
+    "class_type": "VAEDecodeTiled",
+    "inputs": {
+      "samples": [
+        "pair_0_low",
+        0
+      ],
+      "vae": [
+        "vae",
+        0
+      ],
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 32,
+      "temporal_overlap": 8
+    },
+    "_meta": {
+      "title": "VAEDecodeTiled"
+    }
+  },
+  "pair_0_trim": {
+    "class_type": "ImageFromBatch",
+    "inputs": {
+      "image": [
+        "pair_0_decode",
+        0
+      ],
+      "batch_index": 0,
+      "length": 37
+    },
+    "_meta": {
+      "title": "ImageFromBatch"
+    }
+  },
+  "video": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "pair_0_trim",
+        0
+      ],
+      "fps": 24.0,
+      "bit_depth": 8
+    },
+    "_meta": {
+      "title": "CreateVideo"
+    }
+  },
+  "save": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "video",
+        0
+      ],
+      "filename_prefix": "containers/wan_keyframes",
+      "format": "mp4",
+      "codec": "h264"
+    },
+    "_meta": {
+      "title": "SaveVideo"
+    }
+  }
+}

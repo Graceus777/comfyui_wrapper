@@ -76,7 +76,7 @@ def test_merge_names_dedupes_case():
     ]
 
 
-def test_ensure_available_hardlinks_into_comfy(tmp_path: Path):
+def test_ensure_available_keeps_webui_file_in_place(tmp_path: Path):
     webui = tmp_path / "webui"
     comfy = tmp_path / "ComfyUI"
     src_dir = webui / "models" / "Stable-diffusion"
@@ -89,10 +89,8 @@ def test_ensure_available_hardlinks_into_comfy(tmp_path: Path):
     cfg = _cfg(tmp_path, webui_root=str(webui), comfyui_root=str(comfy))
     name = ensure_available("checkpoints", "wai.safetensors", cfg, client=None)
     assert name == "wai.safetensors"
-    dest = dest_dir / "wai.safetensors"
-    assert dest.is_file()
-    assert dest.read_bytes() == b"model-bytes"
-    # second call is a no-op
+    assert not (dest_dir / "wai.safetensors").exists()
+    assert src.read_bytes() == b"model-bytes"
     assert ensure_available("checkpoints", "wai", cfg, client=None) == "wai.safetensors"
 
 

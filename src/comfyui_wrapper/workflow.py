@@ -112,6 +112,13 @@ def nodes_of_type(workflow: dict, class_types: Iterable[str]) -> list[tuple[str,
     ]
 
 
+def _prompt_input(workflow: dict, node_id: str, *, negative: bool = False) -> str:
+    node = workflow.get(str(node_id)) or {}
+    if node.get("class_type") == "TextEncodeQwenImage21":
+        return "negative_prompt" if negative else "prompt"
+    return "text"
+
+
 def node_title(node: dict) -> str:
     meta = node.get("_meta") or {}
     return str(meta.get("title") or "")
@@ -210,10 +217,10 @@ def detect_bindings(workflow: dict) -> dict[str, tuple[str, str]]:
                 set_if_absent(logical, sid, field)
         pos = link_ref(inputs.get("positive"))
         if pos:
-            set_if_absent("positive", pos[0], "text")
+            set_if_absent("positive", pos[0], _prompt_input(workflow, pos[0]))
         neg = link_ref(inputs.get("negative"))
         if neg:
-            set_if_absent("negative", neg[0], "text")
+            set_if_absent("negative", neg[0], _prompt_input(workflow, neg[0], negative=True))
         model = link_ref(inputs.get("model"))
         if model:
             src, _ = walk_skip_loras(workflow, *model)
@@ -301,7 +308,7 @@ def detect_bindings(workflow: dict) -> dict[str, tuple[str, str]]:
             set_if_absent("ref_image_size", nid, "ref_image_size")
         break
     for nid, node in nodes_of_type(workflow, ["LoadImage"]):
-        if str(nid).startswith(("h3_ref_", "h3_last_", "anima_control_image", "img2img_")):
+        if str(nid).startswith(("h3_ref_", "h3_last_", "anima_control_image", "img2img_", "inpaint_", "qwen_ref_")):
             continue
         if "image" in (node.get("inputs") or {}):
             set_if_absent("image", nid, "image")
@@ -315,6 +322,16 @@ def detect_bindings(workflow: dict) -> dict[str, tuple[str, str]]:
         for nid, node in nodes_of_type(workflow, ["LoadImage"]):
             if str(nid).startswith("img2img_") and "image" in (node.get("inputs") or {}):
                 set_if_absent("init_image", nid, "image")
+                break
+    # Inpaint mask has its own key so it never clobbers other LoadImage nodes.
+    if "inpaint_mask_loader" in workflow:
+        loader = workflow.get("inpaint_mask_loader") or {}
+        if "image" in (loader.get("inputs") or {}):
+            set_if_absent("inpaint_mask", "inpaint_mask_loader", "image")
+    else:
+        for nid, node in nodes_of_type(workflow, ["LoadImage"]):
+            if str(nid).startswith("inpaint_") and "image" in (node.get("inputs") or {}):
+                set_if_absent("inpaint_mask", nid, "image")
                 break
     for nid, node in nodes_of_type(workflow, ["CreateVideo"]):
         if "fps" in (node.get("inputs") or {}):
@@ -410,10 +427,10 @@ def _broadcast_geometry(wf: dict, settings: dict[str, Any]) -> None:
             continue
         ctype = node.get("class_type")
         # Ref/last-frame helpers own their own image inputs; the generic
-        # first-frame key must not clobber them. Anima controls and the
-        # img2img init image have their own keys for the same reason.
+        # first-frame key must not clobber them. Anima controls, the
+        # img2img init image, and the inpaint mask have their own keys.
         is_helper = str(nid).startswith(("h3_ref_", "h3_last_"))
-        is_owned_image = str(nid).startswith(("anima_control_image", "img2img_"))
+        is_owned_image = str(nid).startswith(("anima_control_image", "img2img_", "inpaint_", "qwen_ref_"))
         if width is not None and "width" in inputs and not is_helper:
             inputs["width"] = int(width)
         if height is not None and "height" in inputs and not is_helper:
@@ -780,9 +797,33 @@ def inject_img2img(
     return wf
 
 
-def clear_img2img(workflow: dict) -> dict:
-    """Remove img2img nodes and restore the EmptyLatent feed if possible."""
+def clear_inpaint(workflow: dict) -> dict:
+    """Remove inpaint mask nodes, keeping the img2img base if present."""
     wf = deepcopy(workflow)
+    if not any(str(k).startswith("inpaint_") for k in wf):
+        return wf
+    samplers = nodes_of_type(wf, _SAMPLER_NODES)
+    if samplers:
+        sid = samplers[0][0]
+        s_in = wf[sid].get("inputs") or {}
+        current = link_ref(s_in.get("latent_image"))
+        if current and str(current[0]).startswith("inpaint_"):
+            if "img2img_repeat" in wf:
+                s_in["latent_image"] = ["img2img_repeat", 0]
+            elif "img2img_encode" in wf:
+                s_in["latent_image"] = ["img2img_encode", 0]
+            else:
+                latents = nodes_of_type(wf, list(_LATENT_NODES))
+                if latents:
+                    s_in["latent_image"] = [latents[0][0], 0]
+    for key in [k for k in list(wf) if str(k).startswith("inpaint_")]:
+        del wf[key]
+    return wf
+
+
+def clear_img2img(workflow: dict) -> dict:
+    """Remove img2img + inpaint nodes and restore the EmptyLatent feed if possible."""
+    wf = clear_inpaint(workflow)
     if not any(str(k).startswith("img2img_") for k in wf):
         return wf
     samplers = nodes_of_type(wf, _SAMPLER_NODES)
@@ -795,6 +836,142 @@ def clear_img2img(workflow: dict) -> dict:
             s_in["latent_image"] = [latents[0][0], 0]
     for key in [k for k in list(wf) if str(k).startswith("img2img_")]:
         del wf[key]
+    return wf
+
+
+def inject_inpaint(
+    workflow: dict,
+    *,
+    image: str | None,
+    mask: str | None,
+    denoise: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    batch_size: int | None = None,
+    grow: int | float = 0,
+    blur: int | float = 0,
+    invert: bool = False,
+    upscale_method: str = "lanczos",
+    crop: str = "disabled",
+) -> dict:
+    """Convert a txt2img graph to A1111-style whole-picture inpainting.
+
+    Builds on :func:`inject_img2img` (LoadImage → ImageScale → VAEEncode) and
+    adds a mask chain::
+
+        LoadImage(mask) → ImageScale → ImageToMask → GrowMaskWithBlur
+        → [InvertMask] → SetLatentNoiseMask → KSampler.latent_image
+
+    White mask pixels are repainted; black pixels keep the init image. This
+    matches A1111 "Inpaint masked" with masked content "original" over the
+    whole picture. Pass ``invert=True`` for "Inpaint not masked".
+
+    Idempotent: fixed ``img2img_*`` / ``inpaint_*`` node ids are reused.
+    """
+    init_name = str(image or "").strip()
+    mask_name = str(mask or "").strip()
+    if not init_name:
+        raise WorkflowError("inpaint requires an init image")
+    if not mask_name:
+        raise WorkflowError("inpaint requires a mask image (draw a mask first)")
+    try:
+        grow_v = int(float(grow))
+    except (TypeError, ValueError):
+        raise WorkflowError(f"inpaint grow must be a number (got {grow!r})")
+    try:
+        blur_v = int(float(blur))
+    except (TypeError, ValueError):
+        raise WorkflowError(f"inpaint blur must be a number (got {blur!r})")
+    if grow_v < 0 or grow_v > 256:
+        raise WorkflowError("inpaint grow must satisfy 0 <= grow <= 256")
+    if blur_v < 0 or blur_v > 256:
+        raise WorkflowError("inpaint blur must satisfy 0 <= blur <= 256")
+
+    # Base init chain also validates denoise + geometry and wires the sampler.
+    wf = inject_img2img(
+        workflow,
+        image=init_name,
+        denoise=denoise,
+        width=width,
+        height=height,
+        batch_size=batch_size,
+        upscale_method=upscale_method,
+        crop=crop,
+    )
+    samplers = nodes_of_type(wf, _SAMPLER_NODES)
+    if not samplers:
+        raise WorkflowError("Cannot apply inpaint: no KSampler found")
+    sid = samplers[0][0]
+    s_in = wf[sid].get("inputs") or {}
+    # Geometry comes from the (now synced) img2img scale node.
+    scale_inputs = ((wf.get("img2img_scale") or {}).get("inputs") or {})
+    target_w = int(scale_inputs.get("width") or width or 0)
+    target_h = int(scale_inputs.get("height") or height or 0)
+    if target_w <= 0 or target_h <= 0:
+        raise WorkflowError("Cannot apply inpaint: width/height are unknown")
+
+    wf["inpaint_mask_loader"] = {
+        "class_type": "LoadImage",
+        "_meta": {"title": "inpaint mask"},
+        "inputs": {"image": mask_name},
+    }
+    wf["inpaint_mask_scale"] = {
+        "class_type": "ImageScale",
+        "_meta": {"title": "inpaint mask resize"},
+        "inputs": {
+            "image": ["inpaint_mask_loader", 0],
+            "upscale_method": str(upscale_method or "lanczos"),
+            "width": int(target_w),
+            "height": int(target_h),
+            "crop": str(crop or "disabled"),
+        },
+    }
+    wf["inpaint_mask_to_mask"] = {
+        "class_type": "ImageToMask",
+        "_meta": {"title": "inpaint mask to MASK"},
+        "inputs": {
+            "image": ["inpaint_mask_scale", 0],
+            "channel": "red",
+        },
+    }
+    wf["inpaint_mask_grow"] = {
+        "class_type": "GrowMaskWithBlur",
+        "_meta": {"title": "inpaint mask grow/blur"},
+        "inputs": {
+            "mask": ["inpaint_mask_to_mask", 0],
+            "expand": int(grow_v),
+            "incremental_expandrate": 0.0,
+            "tapered_corners": True,
+            "flip_input": False,
+            "blur_radius": float(blur_v),
+            "lerp_alpha": 1.0,
+            "decay_factor": 1.0,
+        },
+    }
+    mask_out: list = ["inpaint_mask_grow", 0]
+    if bool(invert):
+        wf["inpaint_mask_invert"] = {
+            "class_type": "InvertMask",
+            "_meta": {"title": "inpaint mask invert"},
+            "inputs": {"mask": ["inpaint_mask_grow", 0]},
+        }
+        mask_out = ["inpaint_mask_invert", 0]
+    elif "inpaint_mask_invert" in wf:
+        del wf["inpaint_mask_invert"]
+
+    if "img2img_repeat" in wf:
+        latent_src: list = ["img2img_repeat", 0]
+    else:
+        latent_src = ["img2img_encode", 0]
+    wf["inpaint_noise_mask"] = {
+        "class_type": "SetLatentNoiseMask",
+        "_meta": {"title": "inpaint latent mask"},
+        "inputs": {
+            "samples": latent_src,
+            "mask": mask_out,
+        },
+    }
+    s_in["latent_image"] = ["inpaint_noise_mask", 0]
     return wf
 
 

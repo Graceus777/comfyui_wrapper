@@ -187,3 +187,35 @@ def test_build_ui_without_comfy(tmp_path):
     assert "Control image (preprocessed map, or raw photo with Canny)" in labels
     assert "Preprocessor" in labels
     assert "LLLite model patch" in labels
+    assert "Qwen mode" in labels
+    assert "Reference image" in labels
+    assert "More reference images" in labels
+    assert "Match first image" in labels
+    assert "Reference size" in labels
+    assert "Qwen UNET" in labels
+    assert "Qwen CLIP" in labels
+    assert "Qwen VAE" in labels
+    assert "Cache device" in labels
+    assert "Cache dtype" in labels
+    assert "Head swap in a source video" in str(ui_config)
+    assert "Character swap in a source video" in str(ui_config)
+    assert "SAM3 target (character swap: who to replace)" in labels
+    assert "Source video" in labels
+    assert "Source start (seconds)" in labels
+    assert "Source end (seconds; 0 = whole clip)" in labels
+    assert "Replacement character appearance (optional)" in labels
+    mode_change = next(block.fn for block in demo.fns.values() if block.fn and block.fn.__name__ == "on_video_mode")
+    updates = mode_change("charswap", None, False, [], None, [], 0.52, "frame", "", "")
+    assert updates[0]["label"] == "Replacement character appearance (<Picture 1>)"
+    assert updates[2]["visible"] is True  # additional appearance references
+    assert updates[3]["file_count"] == "multiple"  # preserve Gradio's ListFiles backend
+    assert updates[6]["visible"] is True  # source trim
+    assert updates[10]["visible"] is False  # source trim controls duration
+    assert updates[15]["visible"] is False  # fixed preset steps
+    assert updates[16]["value"] is False  # preserve source timing without crossfade
+    selected_source = mode_change("charswap", None, False, ["source.mp4"], None, [], 0.8, "appearance", "", "")
+    assert selected_source[3]["value"] == ["source.mp4"]
+    guided = mode_change("r2v_frames", "sheet.png", False, [], None, [], 0.52, "appearance", "", "")
+    assert guided[0]["value"] is None  # sheet cannot silently become a start frame
+    assert guided[2]["value"] == ["sheet.png"]  # retain it as an appearance reference
+    assert guided[1]["visible"] is True

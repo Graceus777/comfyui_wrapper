@@ -119,7 +119,7 @@ def test_video_config_defaults(tmp_path: Path):
     cfg = from_dict({}, root=tmp_path)
     assert cfg.video.frames == 124
     assert cfg.video.unet.startswith("minimax_h3")
-    assert cfg.video.loop is True
+    assert cfg.video.loop is False
     assert cfg.video.audio_vae.endswith("audio_vae_fp32.safetensors")
     assert cfg.video.recipe == "acc"
     assert cfg.video.steps == 8

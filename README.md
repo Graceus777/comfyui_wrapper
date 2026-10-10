@@ -54,6 +54,22 @@ python webui.py
 
 Opens `http://127.0.0.1:7860`. Same thing via the CLI: `python -m comfyui_wrapper ui` or `comfywrap ui`.
 
+For Tailscale access, double-click [`launch_tailscale.bat`](launch_tailscale.bat).
+It starts the WebUI with `--listen` on port 8000 and prints your Tailscale URL.
+Connect Tailscale and start ComfyUI first, then keep the launcher's window open.
+The launcher uses `.venv` or `venv` when present, otherwise Python on your PATH.
+
+**Workflow tools** adds separate panels for H3 memory saver video, the dedicated
+character-swap LoRA, OmniChar, guided clip upscale, Qwen 2.1 reference control,
+consistent edits, outfit swaps, outpainting, and local Wan keyframe animation.
+Each runs its own preset. See [setup, recipes and verification](workflows/containers/README.md).
+
+**Voice Clone** uses local dots.tts-SOAR with a 3–10 second reference recording.
+Choose **Best match**, enter the exact reference transcript, and enter the new
+words to speak. The tab saves a playable 48 kHz WAV and generation details;
+its separate worker releases GPU memory after each job. Setup and CLI usage:
+[Voice Clone](docs/voice-clone.md).
+
 | Flag | Meaning |
 |------|---------|
 | `--port 7861` | WebUI port (default 7860) |
@@ -62,7 +78,8 @@ Opens `http://127.0.0.1:7860`. Same thing via the CLI: `python -m comfyui_wrappe
 | `--no-browser` | Do not open a browser |
 | `--host` / `--comfy-port` | Override the ComfyUI server from `config.yaml` |
 
-- **txt2img** — prompt / negative, sampling, size, seed, batch count, **img2img**, **Hires. fix**, **Anima LLLite control**, and **ADetailer**. The img2img section takes an init image (resized to Width x Height, VAE-encoded into the first KSampler; denoise is the strength) and works on SDXL, Anima, Krea 2, and Flux GGUF. The Anima section accepts a preprocessed depth, pose, or lineart image plus a model patch, strength, and timestep schedule. Extra networks cover LoRA (`<lora:name:weight>` → ComfyUI LoRA nodes), textual inversion (`embedding:name` from A1111 `embeddings/`), and hypernetworks. Checkpoints, LoRAs, VAE, embeddings, and ControlNet are used from `paths.webui_root` without copying.
+- **txt2img** — prompt / negative, sampling, size, seed, batch count, **img2img**, **Inpaint**, **Hires. fix**, **Anima LLLite control**, and **ADetailer**. The img2img tab takes an init image (resized to Width x Height, VAE-encoded into the first KSampler; denoise is the strength) and works on SDXL, Anima, Krea 2, and Flux GGUF. The Inpaint tab is A1111-style: drop the init image, paint the mask with the brush (white = repaint), tune denoise / mask expand / mask blur / invert; a mask upload overrides the drawing. Inpaint uses whole-picture `SetLatentNoiseMask`, so no inpaint model is needed. The Anima section accepts a preprocessed depth, pose, or lineart image plus a model patch, strength, and timestep schedule. Extra networks cover LoRA (`<lora:name:weight>` → ComfyUI LoRA nodes), textual inversion (`embedding:name` from A1111 `embeddings/`), and hypernetworks. Checkpoints, LoRAs, VAE, embeddings, and ControlNet are used from `paths.webui_root` without copying.
+- **Qwen Image** — Qwen Image 2.1 text-to-image and reference-image edits on the Q6 graph (`qwen_image_2.1-Q6_K.gguf`, `qwen3vl_8b_w4a8.safetensors`, `qwen_image_2.1_vae_bf16.safetensors`). Text-to-image uses Width × Height. Image edit sends up to 10 references into `TextEncodeQwenImage21`; **Match first image** samples at that image's size. Start ComfyUI with `run_qwen_image_2_1_q6_lowvram.bat` on a 12 GB GPU. CLI: `comfywrap qwen --prompt "..."` or `comfywrap qwen --image ref.png --prompt "wear the blue shirt"`.
 - **Batch** — combinator zone + prompt config, plus its own steps / CFG / resolution / sampler, and ADetailer. Preview / Prep / Run, or run an existing `configs/jobs/*.json` file.
 - **History** — recent files in `paths.output`.
 
@@ -75,6 +92,7 @@ python -m comfyui_wrapper generate
 python -m comfyui_wrapper generate --prompt "1girl, looking at viewer" --steps 28 --seed 42
 python -m comfyui_wrapper generate --lora example_char_a:0.8 --lora "example_style:1"
 python -m comfyui_wrapper generate --init-image C:\stills\base.png --denoise 0.6
+python -m comfyui_wrapper generate --init-image C:\stills\base.png --inpaint-mask C:\stills\mask.png --inpaint-denoise 0.75
 python -m comfyui_wrapper generate --dump-workflow patched.json
 ```
 
@@ -212,6 +230,67 @@ workflow:
 UI-format graphs (`nodes` + `links`) are rejected with an error pointing at Export (API).
 
 LoRA injection walks the graph, chains `LoraLoader` (or `LoraLoaderModelOnly` when `generation.lora_mode: model_only`) onto the MODEL/CLIP loaders, and rewires CLIP encode + sampler inputs. Activation text is still concatenated onto the positive prompt.
+
+## Video workflow selection
+
+FL2VA and Ref2VA both accept frame guides. FL2VA specializes in animating the
+supplied scene; Ref2VA also accepts separate appearance, motion and audio
+references. Ref2VA is not a stronger image-to-video setting: an appearance
+reference supplies reusable content rather than forcing the opening pose.
+
+| Workflow in the Video tab | Model | Inputs and roles |
+|---|---|---|
+| Animate a still / start & end frames | FL2VA | Start and/or end pictures are frames of the generated scene. |
+| Reference appearance → new video | Ref2VA | Appearance pictures define the subject; the prompt describes a new scene and action. Optional video/audio references supply additional guidance. |
+| Reference appearance + start / end frames | Ref2VA | Appearance pictures are separate from start/end scene guides. |
+| Character swap in a source video | Ref2VA + Studio Turbo V4 | Replacement appearance, one source clip, and who to replace. |
+| Head swap in a source video | FL2VA + head LoRA + Acc | One replacement face and one source performance. |
+| Text → video | FL2VA | Scene/action prompt without reference inputs. |
+
+The dropdown changes labels, required inputs, compatible models and sampling
+presets. Switching an appearance input into a frame input clears it; when
+entering the combined reference/frame workflow, it is retained as an appearance
+reference. Fixed Acc/Turbo/swap steps are hidden. Base quality exposes Steps;
+reference Turbo presets appear only when their matching LoRAs are installed.
+Resolution controls match the input aspect ratio; disable automatic sizing to
+set width and height. Generation uses 24 fps, with duration rounded to H3's
+supported frame counts. Loop blending is optional and disabled for frame-guided
+references, an end-frame anchor, and swaps.
+
+```powershell
+comfywrap video --mode i2v --image start.png --last-frame end.png --prompt "The character walks across the room."
+comfywrap video --mode r2v --image character-sheet.png --prompt "The character walks across a moonlit courtyard."
+comfywrap video --mode r2v_frames --ref-image character-sheet.png --image opening-scene.png --last-frame ending-scene.png --prompt "The character walks from the opening position to the ending position."
+```
+
+`video.r2v_unet`, `video.ref_recipe` and `video.ref_steps` configure reference
+generation. `video.reference_prompt`, `video.swap_prompt` and `video.text_prompt`
+provide separate prompt defaults; `video.prompt` supplies the still-animation
+default. The CLI rejects an explicitly selected incompatible model/workflow.
+
+## Character replacement
+
+Select **Character swap in a source video** in the Video tab. Upload the new
+character under **Replacement character appearance**, the performance clip under
+**Source video to edit**, and describe **Who to replace in the source video**.
+Use source start/end seconds to select the shot; end `0` uses the remaining clip.
+The default preset edits the first three seconds at 0.8 MP with Turbo V4 Step600.
+
+Source video is resampled to 24 fps at its original speed. H3 frame padding is
+removed from the final video, which retains the selected source audio and
+duration. The picture supplies identity; it is not an init frame. Describe the
+edit in the scene prompt and put optional appearance details in the separate
+character field. A T-pose or character sheet belongs in appearance references,
+and does not become an opening frame. Up to eight additional pictures can show
+the replacement from other angles; all nine pictures describe the same subject.
+The generated prompt follows the source pose and timing from the first frame.
+
+```powershell
+comfywrap video --mode charswap --image character.png --ref-video source.mp4 --sam-target "the person" --source-start 1 --source-end 4 --prompt "Replace the person with the character in <Picture 1>. Keep the source performance."
+```
+
+This matches the reference-based [Studio workflow](https://github.com/BiggerFishy/comfyui-minimax-h3-studio).
+Visual identity and motion adherence remain subject to generation quality.
 
 ## Config map
 

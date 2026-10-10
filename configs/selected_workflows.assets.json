@@ -1,0 +1,22 @@
+{
+  "nodes": [
+    {"repo": "Zironic/H3-Optimizations", "revision": "862774944a331bc1a66cee1cf805b94bd138ebbe", "directory": "H3-Optimizations"},
+    {"repo": "omnichar/ComfyUI-Omnichar", "revision": "093475347073c8f1170d8857809a257c6641e8ae", "directory": "ComfyUI-Omnichar"},
+    {"repo": "capitan01R/ComfyUI-qwen_img_2_1_enhancer", "revision": "fe6caf61b1f705b5ba70e5fd35c93688c3e23496", "directory": "ComfyUI-qwen_img_2_1_enhancer"},
+    {"repo": "dntpi/ComfyUI-H3-Video-Upsampler", "revision": "36cb612ec3df30094eeb4fec66f1528925ebba73", "directory": "ComfyUI-H3-Video-Upsampler"}
+  ],
+  "models": [
+    {"repo": "akatz-ai/MiniMax-H3-Character-Swap-LoRA", "file": "h3_character_swap_pro4500_1000.safetensors", "folder": "loras"},
+    {"repo": "ausboss/Qwen-Image-2.1-Consistency-LoRA", "file": "qwen-image-2.1-consistency.safetensors", "folder": "loras"},
+    {"repo": "ausboss/Qwen-Image-2.1-Outfit-Swap-Consistency-LoRA", "file": "qwen-image-2.1-outfit-swap.safetensors", "folder": "loras"},
+    {"repo": "ausboss/Qwen-Image-2.1-Outpaint-LoRA", "file": "qwen-image-2.1-outpaint-v2.safetensors", "folder": "loras"},
+    {"repo": "sandpies/ComfyUI-H3-Video-Upsampler", "file": "lora/h3upscale_v2_x2.safetensors", "folder": "loras"},
+    {"repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "file": "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "folder": "diffusion_models"},
+    {"repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "file": "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "folder": "diffusion_models"},
+    {"repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged", "file": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "folder": "text_encoders"},
+    {"repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged", "file": "split_files/vae/wan_2.1_vae.safetensors", "folder": "vae"},
+    {"repo": "Kijai/WanVideo_comfy", "file": "LoRAs/AniSora/Wan2_2_I2V_AniSora_3_2_HIGH_rank_64_fp16.safetensors", "folder": "loras"},
+    {"repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "file": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "folder": "loras"}
+  ],
+  "python_packages": ["omnichar-sdk==0.1.1"]
+}

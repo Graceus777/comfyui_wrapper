@@ -2,12 +2,8 @@
 
 The wrapper scans ``webui/models`` on disk (inferred from ``combinator_root``
 or ``paths.webui_root``) and merges those names with whatever ComfyUI already
-lists. If ComfyUI cannot see a file yet, we:
-
-1. Keep ``extra_model_paths.yaml`` pointed at the A1111 folders (needs a ComfyUI
-   restart the first time).
-2. Create directory junctions / file hardlinks into ComfyUI's model dirs so the
-   next filename scan picks them up — no bytes are copied.
+lists. ComfyUI reads the A1111 folders through ``extra_model_paths.yaml``.
+Files are not hardlinked or copied into ComfyUI's own ``models`` tree.
 """
 
 from __future__ import annotations
@@ -570,6 +566,9 @@ def extra_model_paths_payload(webui_root: Path) -> dict:
         "hypernetworks": "models/hypernetworks",
         "controlnet": "models/ControlNet",
         "text_encoders": "models/text_encoders\nmodels/text_encoder\nmodels/clip",
+        # Anima UNETs live next to A1111 checkpoints. Listing the folder here
+        # lets the diffusion loader see them without a second file in ComfyUI.
+        "diffusion_models": "models/Stable-diffusion\nmodels/diffusion_models\nmodels/unet",
     }
 
 
@@ -638,7 +637,7 @@ def comfy_sees_webui(kind: str, cfg: WrapperConfig | None, client) -> bool:
 
 
 def share_webui_models(cfg: WrapperConfig, client=None, *, force: bool = False) -> list[str]:
-    """Point ComfyUI at the A1111 models folder (yaml + junctions). Idempotent."""
+    """Point ComfyUI at the A1111 models folder. Idempotent. Does not link files into ComfyUI."""
     global _SHARED, _SHARE_NOTES
     if _SHARED and not force:
         return list(_SHARE_NOTES)
@@ -661,35 +660,6 @@ def share_webui_models(cfg: WrapperConfig, client=None, *, force: bool = False) 
         except OSError as exc:
             notes.append(f"Could not update extra_model_paths.yaml: {exc}")
 
-        # Junctions only when a live ComfyUI still cannot see A1111 checkpoints.
-        # extra_model_paths already covering the same folders would duplicate names.
-        if client is not None and not comfy_sees_webui("checkpoints", cfg, client):
-            for kind, rels in WEBUI_LAYOUT.items():
-                dests = COMFY_LAYOUT.get(kind)
-                if not dests:
-                    continue
-                target = webui / rels[0]
-                link = comfy / dests[0] / "_webui"
-                if not target.is_dir():
-                    continue
-                try:
-                    if create_junction(link, target):
-                        notes.append(f"Linked {kind} -> {target} (no copy)")
-                        _REMOTE_CACHE.clear()
-                except OSError as exc:
-                    notes.append(f"Could not link {kind}: {exc}")
-
-        # Embeddings / hypernets / VAE live in different A1111 folders and are
-        # often missed even when checkpoints already show up via extra_model_paths.
-        for kind in ("embeddings", "hypernetworks", "vae", "controlnet", "upscale_models", "text_encoders"):
-            n = link_unseen_files(kind, cfg, client)
-            if n:
-                notes.append(f"Linked {n} {kind} from A1111 (no copy)")
-        n = link_adetailer_models(cfg)
-        if n:
-            notes.append(f"Linked {n} ADetailer detectors (no copy)")
-        anima_notes = link_anima_assets(cfg, client)
-        notes.extend(anima_notes)
     else:
         notes.append("ComfyUI root unknown — listings still use the A1111 folder; set paths.comfyui_root to auto-link.")
 
@@ -699,7 +669,7 @@ def share_webui_models(cfg: WrapperConfig, client=None, *, force: bool = False) 
 
 
 def ensure_available(kind: str, name: str, cfg: WrapperConfig | None, client=None) -> str:
-    """Return a filename ComfyUI will accept, linking the A1111 file if needed."""
+    """Return a filename ComfyUI will accept from the A1111 folder or its own tree."""
     raw = str(name or "").replace("\\", "/").strip()
     if not raw:
         return raw
@@ -715,19 +685,4 @@ def ensure_available(kind: str, name: str, cfg: WrapperConfig | None, client=Non
     src = find_local(kind, raw, cfg)
     if src is None:
         return raw
-
-    dest_dirs = comfy_dirs(cfg, kind)
-    if dest_dirs:
-        dest = dest_dirs[0] / src.name
-        try:
-            _hardlink_or_symlink(src, dest)
-            _REMOTE_CACHE.clear()
-        except OSError:
-            pass
-        remote = _remote_list(kind, client)
-        by_base = {Path(n).name.lower(): n for n in remote}
-        if src.name.lower() in by_base:
-            return by_base[src.name.lower()]
-        if dest.exists():
-            return dest.name
     return src.name

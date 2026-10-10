@@ -297,7 +297,7 @@ def _result_from_history(prompt_id: str, history: dict) -> JobResult:
             entry = dict(image)
             entry["node_id"] = str(node_id)
             images.append(entry)
-        for key in ("gifs", "videos", "video"):
+        for key in ("gifs", "videos", "video", "latents", "latent"):
             items = node_out.get(key) or []
             if isinstance(items, dict):
                 items = [items]

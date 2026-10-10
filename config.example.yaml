@@ -21,6 +21,11 @@ paths:
   # Optional ComfyUI tree for extra_model_paths.yaml and model links.
   comfyui_root: ""
 
+# Optional paths for the separate local voice-cloning runtime.
+voice_clone:
+  python: .local/tts/venv/Scripts/python.exe
+  model_dir: models/tts/dots.tts-soar
+
 workflow:
   file: sdxl_txt2img.api.json
   # Leave empty to auto-detect bindings. Override with node_id.input_name.
@@ -72,6 +77,15 @@ generation:
     steps: 20
     cfg: 5.0
     guide_size: 512
+  # A1111-style whole-picture inpaint (white mask = repaint via SetLatentNoiseMask).
+  inpaint:
+    enable: false
+    image: ""        # init image; empty falls back to init_image
+    mask: ""        # white-on-black mask (drawn in the WebUI Inpaint tab or --inpaint-mask)
+    denoise: 0.75
+    grow: 0         # mask expand, px
+    blur: 4         # mask feather, px
+    invert: false   # true = inpaint not masked
 
 batch:
   random_count: 1
@@ -86,7 +100,31 @@ batch:
 video:
   workflow: minimax_h3_i2v_loop.api.json
   r2v_workflow: minimax_h3_r2v_loop.api.json
-  mode: i2v                 # i2v or r2v-lite
+  r2v_unet: minimax_h3_ref2va_pruned_int8_convrot.safetensors
+  ref_recipe: ref_native     # ref_native, or installed ref_turbo4/ref_turbo8
+  ref_steps: 20              # adjustable base quality; Turbo steps are fixed
+  ref_video_audio: true      # use sound from reference videos; can be disabled in the UI
+  ref_turbo4_lora: minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+  ref_turbo8_lora: minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors
+  reference_prompt: ""      # describe the new scene/action
+  swap_prompt: ""           # optional extra edit instructions
+  text_prompt: ""
+  head_swap_workflow: minimax_h3_head_swap.api.json
+  head_swap_unet: minimax_h3_fl2va_pruned_w4a8_mixed.safetensors
+  head_swap_lora: minimax_h3_head_swap_v1.0_r32.safetensors  # applied separately at runtime
+  head_swap_strength: 1.0
+  character_swap_workflow: minimax_h3_character_swap.api.json
+  character_swap_unet: minimax_h3_ref2va_pruned_int8_convrot.safetensors
+  character_swap_lora: minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors
+  character_swap_lora_strength: 1.0
+  character_swap_vae: minimax_h3_video_vae_int8_convrot.safetensors
+  character_swap_shift_video: 6
+  character_swap_size_megapixels: 0.8
+  swap_source_start: 0         # seconds in the original source clip
+  swap_source_end: 3           # 0 uses the whole clip; overrides Frames in swap modes
+  sam3_checkpoint: sam3.1_multiplex_fp16.safetensors  # models/checkpoints
+  sam3_target: ""           # character swap: who SAM3 should replace
+  mode: i2v                 # i2v, r2v, r2v_frames, headswap, charswap, t2v
   recipe: acc               # native, acc, or acc4 when the weight exists
   unet: minimax_h3_fl2va_pruned_w4a8_mixed.safetensors
   clip: qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
@@ -104,7 +142,29 @@ video:
   height: 480
   size_megapixels: 0.52
   ref_image_size: match    # match or max
-  loop: true
+  loop: false
   crossfade_frames: 12
+  save_latents: true    # SaveLatent (.latent) next to each video for the Upscale tab
   latent_upscale: false
   rtx_vsr: false
+
+qwen_image:
+  workflow: qwen_image_2_1.api.json
+  unet: qwen_image_2.1-Q6_K.gguf
+  clip: qwen3vl_8b_w4a8.safetensors
+  vae: qwen_image_2.1_vae_bf16.safetensors
+  steps: 25
+  cfg: 1.0
+  sampler: euler
+  scheduler: simple
+  width: 1024
+  height: 1024
+  resolution: 1024          # reference resize; 0 keeps each image, snapped to 32
+  batch_size: 1
+  seed: -1
+  filename_prefix: qwen_image_2_1
+  cache_device: auto        # auto, gpu, cpu, off
+  cache_dtype: default      # default, int8, int4
+  match_reference: true     # edit samples at the first image's size
+  prompt: ""
+  negative: ""

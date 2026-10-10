@@ -1,4 +1,4 @@
-"""MiniMax H3 I2V recipes: native 12-step vs PDD Acc, with no-fault wiring.
+"""MiniMax H3 frame, reference and swap workflows with matched presets.
 
 Acc is MiniMaxH3PDDAccApply (not Load LoRA). Distills do not stack: turbo /
 Spectrum / sage / SLA / Sol are disabled or bypassed when Acc is on. Wrong
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -39,9 +40,47 @@ REF_AUDIO_PREFIX = "h3_ref_aud_"
 MAX_REF_IMAGES = 9
 MAX_REF_VIDEOS = 3
 MAX_REF_AUDIOS = 3
+HEAD_SWAP_LORA = "minimax_h3_head_swap_v1.0_r32.safetensors"
+HEAD_SWAP_STRENGTH = 1.0
+HEAD_SWAP_UNET = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+HEAD_LORA_ID = "h3_head_lora"
+FACE_IMAGE_ID = "h3_face"
+BODY_VIDEO_ID = "h3_body"
+BODY_VC_ID = "h3_body_vc"
+BODY_TRIM_ID = "h3_body_trim"
+HEAD_GUIDE_ID = "h3_guide"
+_HEAD_SWAP_MODES = frozenset({"headswap", "head_swap", "faceswap", "face_swap"})
+SAM3_CHECKPOINT = "sam3.1_multiplex_fp16.safetensors"
+CHAR_UNET = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+CHAR_LORA = "minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors"
+CHAR_LORA_ID = "h3_ref_lora"
+CHAR_LORA_STRENGTH = 1.0
+CHAR_SHIFT_VIDEO = 6.0
+CHAR_STEPS = 8
+CHAR_SAMPLER = "res_multistep"
+CHAR_VAE = "minimax_h3_video_vae_int8_convrot.safetensors"
+CHAR_IMAGE_ID = "h3_ref_char"
+CHAR_SAM_ID = "h3_sam3"
+CHAR_TEXT_ID = "h3_sam3_text"
+CHAR_TRACK_ID = "h3_sam3_track"
+CHAR_MASK_ID = "h3_sam3_mask"
+CHAR_INVERT_ID = "h3_invert"
+CHAR_TREAT_ID = "h3_treat"
+_CHAR_SWAP_MODES = frozenset({"charswap", "char_swap", "character_swap", "characterswap"})
+_INVERT_MARK = (
+    "The altered colors in the selected source area identify where to regenerate; "
+    "render natural colors there, not photographic-negative colors."
+)
+_FACE_DETAILS_MARK = "Facial details of <Subject 1>:\n"
 DEFAULT_LATENT_UPSCALER = "minimax_h3_latent_upscaler_3d_fp16.safetensors"
 
 DEFAULT_UNET = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+
+
+def h3_frame_count(frames: int) -> int:
+    """Round up to H3's 17n+5 temporal grid."""
+    frames = max(5, int(frames))
+    return frames + (5 - frames) % 17
 FALLBACK_UNET = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 DEFAULT_CLIP = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 DEFAULT_VAE = "minimax_h3_video_vae_fp16.safetensors"
@@ -89,13 +128,14 @@ class H3Recipe:
     scheduler: str
     acc: bool
     nfe: int | None
+    shift_video: float = SHIFT_VIDEO
 
 
 RECIPES: dict[str, H3Recipe] = {
     "native": H3Recipe(
         key="native",
-        label="Native (12-step)",
-        steps=12,
+        label="Quality (base model)",
+        steps=20,
         sampler="res_multistep",
         scheduler="simple",
         acc=False,
@@ -119,7 +159,106 @@ RECIPES: dict[str, H3Recipe] = {
         acc=True,
         nfe=4,
     ),
+    "ref_native": H3Recipe("ref_native", "Quality (base Ref2VA)", 20, "res_multistep", "normal", False, None),
+    "ref_turbo4": H3Recipe("ref_turbo4", "Fast (reference Turbo, 4 steps)", 4, "euler", "simple", False, None),
+    "ref_turbo8": H3Recipe("ref_turbo8", "Fast (reference Turbo, 8 steps)", 8, "euler", "simple", False, None, 6.0),
 }
+
+REF_TURBO4 = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+REF_TURBO8 = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+VIDEO_MODES = [
+    ("Animate a still / start & end frames", "i2v"),
+    ("Reference appearance → new video", "r2v"),
+    ("Reference appearance + start / end frames", "r2v_frames"),
+    ("Character swap in a source video", "charswap"),
+    ("Head swap in a source video", "headswap"),
+    ("Text → video", "t2v"),
+]
+
+
+def normalize_video_mode(raw: Any) -> str:
+    key = str(raw or "i2v").strip().lower().replace("-", "_")
+    aliases = {"flf": "i2v", "flf2v": "i2v", "ref": "r2v", "reference": "r2v",
+               "r2v_lite": "r2v", "r2vlite": "r2v", "ref_frames": "r2v_frames"}
+    if key in _CHAR_SWAP_MODES:
+        return "charswap"
+    if key in _HEAD_SWAP_MODES:
+        return "headswap"
+    key = aliases.get(key, key)
+    if key not in {value for _label, value in VIDEO_MODES}:
+        raise ValueError(f"Unknown video workflow {raw!r}")
+    return key
+
+
+def video_prompt_default(defaults: Any, mode: str) -> str:
+    mode = normalize_video_mode(mode)
+    field = ("swap_prompt" if mode in {"charswap", "headswap"} else "reference_prompt"
+             if mode in {"r2v", "r2v_frames"} else "text_prompt" if mode == "t2v" else "prompt")
+    return str(getattr(defaults, field, "") or "")
+
+
+def video_model_choices(names: Iterable[str], mode: str) -> list[str]:
+    """Only offer the checkpoint family trained for the selected workflow."""
+    trunk = "ref2va" if normalize_video_mode(mode) in {"r2v", "r2v_frames", "charswap"} else "fl2va"
+    return [name for name in names if is_h3_unet(name) and h3_trunk(name) == trunk
+            and not any(tag in name.lower() for tag in
+                        ("fasth3", "headswap", "hybrid", "turbo", "fused", "dmd", "hyperflow", "lightx", "_acc_", "-acc-"))]
+
+
+def reference_recipe_choices(loras: Iterable[str], defaults: Any = None) -> list[tuple[str, str]]:
+    names = {Path(name.replace("\\", "/")).name.lower() for name in loras}
+    result = [(RECIPES["ref_native"].label, "ref_native")]
+    for key, field, fallback in (("ref_turbo4", "ref_turbo4_lora", REF_TURBO4),
+                                 ("ref_turbo8", "ref_turbo8_lora", REF_TURBO8)):
+        name = getattr(defaults, field, fallback) or fallback
+        if Path(name.replace("\\", "/")).name.lower() in names:
+            result.append((RECIPES[key].label, key))
+    return result
+
+
+def video_workflow_options(mode: str, defaults: Any, *, unets: Iterable[str] = (),
+                           acc_files: Iterable[str] = (), loras: Iterable[str] = (),
+                           recipe: str | None = None) -> dict[str, Any]:
+    mode = normalize_video_mode(mode)
+    reference = mode in {"r2v", "r2v_frames"}
+    swap = mode in {"charswap", "headswap"}
+    names = video_model_choices(unets, mode)
+    preferred = (defaults.character_swap_unet if mode == "charswap" else defaults.head_swap_unet
+                 if mode == "headswap" else defaults.r2v_unet if reference else defaults.unet)
+    model = pick_model_name(names, preferred) or preferred
+    if model not in names:
+        names = [model, *names]
+    if reference:
+        choices = reference_recipe_choices(loras, defaults)
+        wanted = recipe or defaults.ref_recipe
+    elif mode == "charswap":
+        choices, wanted = [("Character swap preset", "native")], "native"
+    elif mode == "headswap":
+        choices, wanted = [("Head swap preset", "acc")], "acc"
+    else:
+        matched = [n for n in acc_files if h3_trunk(n) == "fl2va"]
+        choices = [(RECIPES["native"].label, "native")]
+        if matched:
+            choices += [(RECIPES["acc"].label, "acc")]
+            if has_acc_4step_weight(matched):
+                choices += [(RECIPES["acc4"].label, "acc4")]
+        wanted = recipe or defaults.recipe
+    selected = wanted if wanted in {key for _label, key in choices} else choices[0][1]
+    rec = RECIPES[selected]
+    steps = CHAR_STEPS if mode == "charswap" else defaults.ref_steps if selected == "ref_native" else rec.steps
+    hints = {
+        "i2v": "Animate the supplied scene. Start and end pictures anchor the composition and pose. Supply at least one frame.",
+        "r2v": "Use a character or design in a new scene. Appearance pictures do not set the opening frame. Describe the scene and action below.",
+        "r2v_frames": "Use appearance references and separately anchor the opening or ending scene. Supply references and at least one frame guide.",
+        "charswap": "Replace the selected subject. Appearance pictures define the replacement; the source video supplies the pose, action and timing.",
+        "headswap": "Replace the head using one face picture. The source video supplies the body, action and timing.",
+        "t2v": "Describe a scene and action to generate a video without image inputs.",
+    }
+    return {"mode": mode, "reference": reference, "swap": swap, "models": names, "model": model,
+            "recipes": choices, "recipe": selected, "steps": steps,
+            "steps_visible": not swap and selected in {"native", "ref_native"},
+            "acc": match_acc_file(model, acc_files, defaults.acc_file, nfe=rec.nfe) if rec.acc else "",
+            "hint": hints[mode]}
 
 _RECIPE_ALIASES = {
     "": "native",
@@ -137,6 +276,9 @@ _RECIPE_ALIASES = {
     "acc4": "acc4",
     "4": "acc4",
     "4step": "acc4",
+    "refnative": "ref_native",
+    "refturbo4": "ref_turbo4",
+    "refturbo8": "ref_turbo8",
 }
 
 
@@ -315,8 +457,8 @@ def is_h3_unet(name: str | None) -> bool:
 
 
 def is_h3_clip(name: str | None) -> bool:
-    text = (name or "").lower()
-    return "minimax" in text or "qwen3vl_32b" in text
+    text = (name or "").lower().replace("-", "_")
+    return "qwen3vl_32b" in text
 
 
 def is_h3_video_vae(name: str | None) -> bool:
@@ -614,6 +756,345 @@ def apply_h3_latent_upscale(
     return wf
 
 
+LATENT_SUFFIXES = {".latent", ".safetensors"}
+CLIP_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv"}
+SAVE_LATENT_ID = "h3_save_latent"  # legacy single-node id (joint AV — crashes stock SaveLatent, pruned)
+SAVE_SPLIT_ID = "h3_save_split"
+SAVE_VIDEO_ID = "h3_save_latent_video"
+SAVE_AUDIO_ID = "h3_save_latent_audio"
+
+
+def sibling_latent_pair(path: str | Path) -> tuple[Path | None, Path | None]:
+    """Given one dropped .latent, find its (video, audio) pair in the same folder.
+
+    Stock ``SaveLatent`` cannot save the joint H3 AV latent (NestedTensor has
+    no ``.contiguous()``), so :func:`ensure_save_latent` saves the split
+    halves as ``<prefix>_video_*.latent`` + ``<prefix>_audio_*.latent``.
+    Returns ``(video_path, audio_path)`` with Nones for the missing half.
+    """
+    src = Path(str(path or ""))
+    parent = src.parent
+    stem = src.stem
+    suffix = src.suffix.lower()
+    alt_suffixes = [suffix] + [s for s in (".latent", ".safetensors") if s != suffix]
+
+    def _existing(stem_cand: str) -> Path | None:
+        for suf in alt_suffixes:
+            cand = parent / f"{stem_cand}{suf}"
+            try:
+                if cand.is_file():
+                    return cand
+            except OSError:
+                continue
+        return None
+
+    if "_video" in stem:
+        video = _existing(stem) or (src if src.suffix.lower() in LATENT_SUFFIXES else None)
+        audio = _existing(stem.replace("_video", "_audio"))
+        return video, audio
+    if "_audio" in stem:
+        audio = _existing(stem) or (src if src.suffix.lower() in LATENT_SUFFIXES else None)
+        video = _existing(stem.replace("_audio", "_video"))
+        return video, audio
+    # Unmarked single file: assume it is the video half (joint AV latents
+    # cannot be produced by stock SaveLatent, so there is nothing else it
+    # could be that stock LoadLatent can read back usefully).
+    single = _existing(stem) or (src if src.suffix.lower() in LATENT_SUFFIXES else None)
+    return single, None
+
+
+def resolve_dropped_latent_pair(paths: Iterable[str | Path]) -> tuple[Path | None, Path | None]:
+    """Pick (video, audio) latents out of a multi-file drop (e.g. Gradio temp dir).
+
+    ``sibling_latent_pair`` only looks next to one file, but the WebUI
+    ``Upscale`` tab uploads to an isolated temp dir — dropping just
+    ``*_video.latent`` leaves the ``*_audio.latent`` sibling behind, so the
+    upscale silently renders without audio. Passing both halves explicitly
+    fixes it; this helper finds them in the uploaded set.
+    """
+    cands: list[Path] = []
+    for raw in paths or []:
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (str, Path)):
+                text = str(raw).strip()
+            elif isinstance(raw, dict):
+                text = ""
+                for key in ("path", "name", "filename", "orig_name", "url"):
+                    cand = raw.get(key)
+                    if isinstance(cand, str) and cand.strip():
+                        text = cand.strip()
+                        break
+                if not text:
+                    continue
+            else:
+                cand = getattr(raw, "name", None)
+                if isinstance(cand, (str, Path)) and str(cand).strip():
+                    full = str(raw).strip()
+                    name = str(cand).strip()
+                    try:
+                        if Path(full).is_file():
+                            text = full
+                        elif Path(name).is_file():
+                            text = name
+                        else:
+                            text = full or name
+                    except OSError:
+                        text = name
+                else:
+                    text = str(raw).strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        try:
+            cand = Path(text)
+        except Exception:
+            continue
+        try:
+            if cand.is_file():
+                cands.append(cand)
+        except OSError:
+            continue
+    latents = [p for p in cands if p.suffix.lower() in LATENT_SUFFIXES]
+    if not latents:
+        # No latents at all — let the caller fall back to single-file handling
+        # (e.g. an .mp4 for RTX VSR).
+        if not cands:
+            return None, None
+        return sibling_latent_pair(cands[0])
+    videos = [p for p in latents if "_video" in p.stem]
+    audios = [p for p in latents if "_audio" in p.stem and "_video" not in p.stem]
+    if videos and audios:
+        video = videos[0]
+        want = video.stem.replace("_video", "_audio")
+        for cand in audios:
+            if cand.stem == want:
+                return video, cand
+        return video, audios[0]
+    if videos and not audios:
+        video = videos[0]
+        _video, sibling_audio = sibling_latent_pair(video)
+        if sibling_audio is not None:
+            return video, sibling_audio
+        # Same temp dir but different naming? Fall back to any other latent.
+        others = [p for p in latents if p != video]
+        if others:
+            return video, others[0]
+        return video, None
+    if audios and not videos:
+        audio = audios[0]
+        sibling_video, _audio = sibling_latent_pair(audio)
+        if sibling_video is not None:
+            return sibling_video, audio
+        others = [p for p in latents if p != audio]
+        if others:
+            return others[0], audio
+        return None, audio
+    # Unmarked latents: first is video; a second file (if dropped) is audio.
+    video = latents[0]
+    if len(latents) >= 2:
+        return video, latents[1]
+    _video, sibling_audio = sibling_latent_pair(video)
+    return video, sibling_audio
+
+
+def detect_upscale_kind(path: str | Path | None) -> str:
+    """Return 'latent' for saved AV latents, 'clip' for rendered video."""
+    suffix = Path(str(path or "")).suffix.lower()
+    if suffix in LATENT_SUFFIXES:
+        return "latent"
+    if suffix in CLIP_SUFFIXES:
+        return "clip"
+    raise ValueError(
+        f"Cannot detect upscale kind for {path!r}: "
+        "drop a .latent (3D 2x) or a rendered clip .mp4/.webm/.mov/.mkv (RTX VSR)"
+    )
+
+
+def ensure_save_latent(workflow: dict, prefix: str = "h3_latent") -> dict:
+    """Save the split video/audio halves so the Upscale tab can decode-only 2x later.
+
+    Stock ``SaveLatent`` calls ``samples["samples"].contiguous()``, which
+    crashes on the joint H3 AV latent (``NestedTensor`` has no
+    ``.contiguous``). So split first via ``LTXVSeparateAVLatent`` and save
+    each plain-tensor half: ``<prefix>_video_*.latent`` + ``<prefix>_audio_*.latent``.
+
+    Idempotent: reuses ``h3_save_split`` / ``h3_save_latent_video`` /
+    ``h3_save_latent_audio`` when present, and prunes the legacy single
+    ``h3_save_latent`` joint node (it always crashes).
+    """
+    wf = deepcopy(workflow)
+    wf.pop(SAVE_LATENT_ID, None)
+    samplers = nodes_of_type(wf, ["SamplerCustomAdvanced"])
+    if not samplers:
+        raise ValueError("H3 graph has no SamplerCustomAdvanced to attach SaveLatent")
+    sid = samplers[0][0]
+    base = (prefix or "h3_latent").strip() or "h3_latent"
+    wf[SAVE_SPLIT_ID] = {
+        "class_type": "LTXVSeparateAVLatent",
+        "_meta": {"title": "Split AV latent for save"},
+        "inputs": {"av_latent": [sid, 0]},
+    }
+    wf[SAVE_VIDEO_ID] = {
+        "class_type": "SaveLatent",
+        "_meta": {"title": "H3 save video latent"},
+        "inputs": {
+            "samples": [SAVE_SPLIT_ID, 0],
+            "filename_prefix": f"{base}_video",
+        },
+    }
+    wf[SAVE_AUDIO_ID] = {
+        "class_type": "SaveLatent",
+        "_meta": {"title": "H3 save audio latent"},
+        "inputs": {
+            "samples": [SAVE_SPLIT_ID, 1],
+            "filename_prefix": f"{base}_audio",
+        },
+    }
+    return wf
+
+
+def latent_upscale_graph(
+    video_latent_key: str,
+    prefix: str,
+    *,
+    audio_latent_key: str | None = None,
+    vae: str | None = None,
+    audio_vae: str | None = None,
+    model_name: str | None = None,
+    scale: float = 2.0,
+    fps: float = 24.0,
+    align: int = 32,
+    enable_temporal_chunking: bool = True,
+    force_unload: bool = True,
+    device: str = "cuda",
+    precision: str = "fp16",
+) -> dict:
+    """Decode-only graph from split latents: LoadLatent(s) → 3D 2x video → VAEDecode(+Audio) → SaveVideo.
+
+    No sampler runs and no AV split is needed: :func:`ensure_save_latent`
+    already saved the plain-tensor halves, so each ``LoadLatent`` output
+    feeds its decoder directly. ``audio_latent_key`` is optional — without
+    it the upscaled clip is silent.
+    """
+    if not str(video_latent_key or "").strip():
+        raise ValueError("latent_upscale_graph needs a video latent input key")
+    video_key = str(video_latent_key)
+    audio_key = str(audio_latent_key or "").strip() or None
+    upscaler_inputs: dict[str, Any] = {
+        "latent": ["1", 0],
+        "model_name": model_name or DEFAULT_LATENT_UPSCALER,
+        "mode": "scale by multiplier",
+        "mode.scale": float(scale),
+        "align": int(align),
+        "enable_temporal_chunking": bool(enable_temporal_chunking),
+        "force_unload": bool(force_unload),
+        "device": device,
+        "precision": precision,
+    }
+    if audio_key:
+        return {
+            "1": {
+                "class_type": "LoadLatent",
+                "_meta": {"title": "Load video latent"},
+                "inputs": {"latent": video_key},
+            },
+            "2": {
+                "class_type": "LoadLatent",
+                "_meta": {"title": "Load audio latent"},
+                "inputs": {"latent": audio_key},
+            },
+            "3": {
+                "class_type": "MinimaxH3LatentUpscaler3D",
+                "_meta": {"title": "H3 3D latent upscaler"},
+                "inputs": upscaler_inputs,
+            },
+            "4": {
+                "class_type": "VAELoader",
+                "_meta": {"title": "H3 Video VAE"},
+                "inputs": {"vae_name": vae or DEFAULT_VAE},
+            },
+            "5": {
+                "class_type": "VAELoader",
+                "_meta": {"title": "H3 Audio VAE"},
+                "inputs": {"vae_name": audio_vae or DEFAULT_AUDIO_VAE},
+            },
+            "6": {
+                "class_type": "VAEDecode",
+                "_meta": {"title": "VAE Decode video"},
+                "inputs": {"samples": ["3", 0], "vae": ["4", 0]},
+            },
+            "7": {
+                "class_type": "VAEDecodeAudio",
+                "_meta": {"title": "VAE Decode Audio"},
+                "inputs": {"samples": ["2", 0], "vae": ["5", 0]},
+            },
+            "8": {
+                "class_type": "CreateVideo",
+                "_meta": {"title": "Create upscaled video"},
+                "inputs": {
+                    "images": ["6", 0],
+                    "fps": float(fps),
+                    "audio": ["7", 0],
+                    "bit_depth": 8,
+                },
+            },
+            "9": {
+                "class_type": "SaveVideo",
+                "_meta": {"title": "Save upscaled video"},
+                "inputs": {
+                    "video": ["8", 0],
+                    "filename_prefix": prefix,
+                    "format": "mp4",
+                    "codec": "h264",
+                },
+            },
+        }
+    return {
+        "1": {
+            "class_type": "LoadLatent",
+            "_meta": {"title": "Load video latent"},
+            "inputs": {"latent": video_key},
+        },
+        "3": {
+            "class_type": "MinimaxH3LatentUpscaler3D",
+            "_meta": {"title": "H3 3D latent upscaler"},
+            "inputs": upscaler_inputs,
+        },
+        "4": {
+            "class_type": "VAELoader",
+            "_meta": {"title": "H3 Video VAE"},
+            "inputs": {"vae_name": vae or DEFAULT_VAE},
+        },
+        "6": {
+            "class_type": "VAEDecode",
+            "_meta": {"title": "VAE Decode video"},
+            "inputs": {"samples": ["3", 0], "vae": ["4", 0]},
+        },
+        "8": {
+            "class_type": "CreateVideo",
+            "_meta": {"title": "Create upscaled video"},
+            "inputs": {
+                "images": ["6", 0],
+                "fps": float(fps),
+                "bit_depth": 8,
+            },
+        },
+        "9": {
+            "class_type": "SaveVideo",
+            "_meta": {"title": "Save upscaled video"},
+            "inputs": {
+                "video": ["8", 0],
+                "filename_prefix": prefix,
+                "format": "mp4",
+                "codec": "h264",
+            },
+        },
+    }
+
+
 def rtx_vsr_graph(
     input_key: str,
     prefix: str,
@@ -738,7 +1219,7 @@ def set_r2v_refs(
     ref_image_size: str = "match",
     include_video_audio: bool = True,
 ) -> dict:
-    """Wire R2V-lite refs onto the Ref2VA node. Reuses the FL2VA UNET.
+    """Wire semantic references onto the Ref2VA node.
 
     Dotted keys follow the ComfyUI API convention
     (``ref_images.ref_image_0`` ...). LoadVideo rides through
@@ -803,4 +1284,501 @@ def set_r2v_refs(
     _prune_helper_prefix(wf, REF_VIDEO_PREFIX, keep)
     _prune_helper_prefix(wf, REF_VC_PREFIX, keep)
     _prune_helper_prefix(wf, REF_AUDIO_PREFIX, keep)
+    return wf
+
+
+def set_reference_frame_guides(workflow: dict, *, first_frame: str | None = None,
+                               last_frame: str | None = None) -> dict:
+    """Keep timeline anchors separate from numbered appearance references."""
+    wf = deepcopy(workflow)
+    r2v = _first_id(wf, [R2V_NODE])
+    if r2v is None:
+        raise ValueError("Frame-guided references need MiniMaxH3ReferenceToVideo")
+    inputs = wf[r2v]["inputs"]
+    for nid in list(wf):
+        if nid.startswith("h3_frame_"):
+            rewire_consumers(wf, (nid, 0), (r2v, 0), skip_node_ids={nid})
+            wf.pop(nid)
+    positive = [r2v, 0]
+    helpers = set()
+    for role, key, index in (("start", first_frame, 0), ("end", last_frame, -1)):
+        if not key:
+            continue
+        image_id, guide_id = f"h3_frame_{role}_image", f"h3_frame_{role}_guide"
+        helpers.update({image_id, guide_id})
+        wf[image_id] = {"class_type": "LoadImage", "inputs": {"image": key}}
+        wf[guide_id] = {
+            "class_type": GUIDE_NODE,
+            "_meta": {"title": f"Anchor the {role} frame"},
+            "inputs": {"positive": positive, "latent": [r2v, 1], "vae": inputs["vae"],
+                       "image": [image_id, 0], "frame_idx": index},
+        }
+        positive = [guide_id, 0]
+    rewire_consumers(wf, (r2v, 0), tuple(positive), skip_node_ids=helpers)
+    return wf
+
+
+def reference_video_prompt(prompt: str | None, *, image_count: int,
+                           reference_description: str | None = None,
+                           guided: bool = False) -> str:
+    user = str(prompt or "").strip()
+    if "subject_definitions:" in user and "summary:" in user:
+        return user
+    task = "keyframe completion + reference generation" if guided else "reference generation"
+    instructions = f"[{task}] Generate the requested scene using the connected references."
+    if image_count:
+        instructions += (
+            " Use the subject in <Picture 1> as the primary appearance reference, unless the scene instructions assign a different role. "
+            "Appearance references define identity and design without forcing an opening pose. "
+            "Multiple views on a character sheet depict one character; do not display the sheet or duplicate its character."
+        )
+    if guided:
+        instructions += " Follow the connected timeline guides for the opening and ending composition and pose."
+    if reference_description:
+        instructions += "\nAppearance details: " + str(reference_description).strip()
+    return instructions + "\n\n" + user
+
+
+def apply_reference_recipe(workflow: dict, *, recipe: H3Recipe,
+                           lora_name: str | None = None, steps: int | None = None) -> dict:
+    wf = deepcopy(workflow)
+    _strip_distill_loras(wf)
+    wf = apply_h3_graph(wf, recipe="native",
+                        steps=recipe.steps if recipe.key != "ref_native" else (steps or recipe.steps))
+    _set_sampler(wf, recipe.sampler,
+                 recipe.steps if recipe.key != "ref_native" else (steps or recipe.steps), recipe.scheduler)
+    for _nid, node in nodes_of_type(wf, [SHIFT_NODE]):
+        node["inputs"]["shift_video"] = recipe.shift_video
+    if recipe.key == "ref_native":
+        return wf
+    if not lora_name:
+        raise ValueError("The selected reference Turbo preset needs its matching LoRA")
+    loader = _first_id(wf, ["UNETLoader"])
+    if loader is None:
+        raise ValueError("Reference workflow is missing its model loader")
+    nid = "h3_reference_turbo"
+    wf[nid] = {"class_type": "LoraLoaderModelOnly",
+               "inputs": {"model": [loader, 0], "lora_name": lora_name, "strength_model": 1.0}}
+    rewire_consumers(wf, (loader, 0), (nid, 0), skip_node_ids={nid})
+    return wf
+
+
+def clear_first_frame(workflow: dict) -> dict:
+    """Disconnect frame initialization for end-only or text generation."""
+    wf = deepcopy(workflow)
+    candidates = []
+    for _nid, node in nodes_of_type(wf, [I2V_NODE]):
+        src = link_ref(node.setdefault("inputs", {}).pop("first_frame", None))
+        if src:
+            candidates.append(src[0])
+    while candidates:
+        nid = candidates.pop()
+        node = wf.get(nid)
+        if not node or node.get("class_type") not in {"ImageScale", "LoadImage"}:
+            continue
+        if any(link_ref(value) and link_ref(value)[0] == nid
+               for other in wf.values() for value in (other.get("inputs") or {}).values()):
+            continue
+        candidates.extend(src[0] for value in (node.get("inputs") or {}).values()
+                          if (src := link_ref(value)))
+        wf.pop(nid)
+    return wf
+
+
+# Alissonerdx head-swap template. The face still is <Picture 1> / <Subject 1>.
+# The source clip is the aligned MiniMaxH3AddGuide at frame 0, referred to as <Video 1>.
+HEAD_SWAP_PROMPT = """head_swap:
+
+subject_definitions:
+
+<Subject 1> is the reference head identity from <Picture 1>, including the complete head, facial identity, facial structure, head shape, hairstyle, hairline, skin appearance, proportions, and all distinctive visual features.
+
+Facial details of <Subject 1>:
+
+<Subject 2> is the original person in <Video 1>, whose body, neck, clothing, pose, physical proportions below the head, actions, motion, timing, and interaction with the environment must remain unchanged.
+
+<Video 1> is the source video for the target video edit, providing the original body performance, motion, camera movement, framing, timing, lighting, environment, scene composition, and temporal structure.
+
+summary:
+
+[video editing + reference generation]
+
+The target video is an edited version of <Video 1>. Replace only the entire head of <Subject 2> with the reference head identity defined by <Subject 1> from <Picture 1>. Preserve the source video's body, clothing, performance, motion, camera behavior, environment, lighting, timing, and composition.
+
+retention_analysis:
+
+<Subject 1> (appears throughout the target video): attribute_transfer - the complete head identity from <Picture 1>, including facial identity, facial structure, hairstyle, head shape, proportions, skin appearance, and distinctive features, is transferred consistently onto the body of <Subject 2>.
+
+<Subject 2> (appears throughout the target video): partially_preserved - the original body, neck position, clothing, pose, motion, gestures, actions, and physical performance are preserved, while only the original head is replaced.
+
+<Video 1> (entire target timeline): partially_preserved - the original video timing, body motion, camera movement, framing, lighting, background, environment, scene composition, and temporal structure are preserved; only the subject's head appearance is modified.
+
+detailed_description:
+
+Preserve <Video 1> as the complete temporal and compositional foundation of the target video. <Subject 2> retains the exact original body, clothing, pose, body proportions, movement, gestures, actions, speed, timing, and interaction with the environment.
+
+Replace only the entire original head of <Subject 2> with <Subject 1>, the reference head identity from <Picture 1>. Preserve the complete recognizable identity of <Subject 1>, including facial structure, skull and head shape, hairstyle, hairline, skin appearance, facial proportions, eyes, eyebrows, nose, mouth, jawline, ears, and distinctive identifying features.
+
+The transferred head follows the original head motion and performance of <Subject 2> throughout <Video 1>, including head rotation, tilt, pitch, yaw, natural translation, facial orientation, gaze direction, and perspective changes. Maintain anatomically correct head scale and a seamless connection between the transferred head and the original neck.
+
+Preserve the lighting conditions of <Video 1> on the transferred head. The head naturally responds to changes in illumination, shadows, highlights, color temperature, exposure, depth of field, motion blur, occlusion, camera angle, and perspective while continuously maintaining the identity established by <Picture 1>.
+
+Maintain strong temporal consistency across every frame. The identity, facial geometry, hairstyle, head size, skin appearance, and distinguishing features of <Subject 1> remain stable during motion and viewpoint changes. Prevent identity drift, facial morphing, hairstyle changes, head-size fluctuations, geometry instability, texture crawling, temporal flickering, frame-to-frame inconsistency, or sudden changes in facial appearance.
+
+Do not alter the body, clothing, hands, pose, gestures, action, background, objects, environment, camera trajectory, framing, lens behavior, scene timing, or composition inherited from <Video 1>. The final result should appear as though <Subject 1>'s head naturally belonged to <Subject 2>'s body during the original recorded performance.
+
+overall_soundscape:
+
+Preserve the original audiovisual timing and visible action structure of <Video 1>. No visual modifications are made outside the head replacement.
+
+non_diegetic_music:
+N/A
+"""
+
+
+def is_head_swap_mode(mode: str | None) -> bool:
+    key = str(mode or "").strip().lower().replace("-", "_")
+    return key in _HEAD_SWAP_MODES
+
+
+def head_swap_prompt(extra: str | None = None) -> str:
+    """Official head_swap: template. A short note fills the facial-details slot.
+
+    A prompt that already starts with the trigger, or pastes the template, is
+    sent through unchanged.
+    """
+    text = str(extra or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("head_swap:") or "\nhead_swap:" in lowered:
+        return text
+    base = HEAD_SWAP_PROMPT
+    at = base.find(_FACE_DETAILS_MARK)
+    if at < 0 or not text:
+        return base
+    at += len(_FACE_DETAILS_MARK)
+    return base[:at] + text.rstrip() + "\n" + base[at:]
+
+
+def apply_head_swap(
+    workflow: dict,
+    *,
+    face_image: str,
+    source_video: str,
+    length: int,
+    unet_name: str | None = None,
+    lora_name: str | None = None,
+    lora_strength: float = HEAD_SWAP_STRENGTH,
+) -> dict:
+    """Load the regular w4a8 UNET and a separate head-swap LoRA.
+
+    The rank-32 face edit is applied at ``lora_strength`` before sigma shift.
+    ``apply_h3_graph`` then inserts PDD Acc on the sigma-shift output when
+    that recipe is selected. The face still is ``<Picture 1>`` and the
+    source clip is the aligned guide at frame 0 (``<Video 1>``).
+    """
+    face = str(face_image or "").strip()
+    source = str(source_video or "").strip()
+    if not face:
+        raise ValueError("Head swap needs a face still for <Picture 1>")
+    if not source:
+        raise ValueError("Head swap needs a source clip for <Video 1>")
+    wf = deepcopy(workflow)
+    expected = {
+        FACE_IMAGE_ID: "LoadImage",
+        BODY_VIDEO_ID: "LoadVideo",
+        BODY_VC_ID: "GetVideoComponents",
+        BODY_TRIM_ID: "ImageFromBatch",
+        HEAD_GUIDE_ID: GUIDE_NODE,
+    }
+    for nid, kind in expected.items():
+        node = wf.get(nid)
+        if not isinstance(node, dict) or node.get("class_type") != kind:
+            raise ValueError(f"Head swap graph is missing {kind} node {nid}")
+    r2v = _first_id(wf, [R2V_NODE])
+    if r2v is None:
+        raise ValueError("Head swap graph has no MiniMaxH3ReferenceToVideo node")
+    loader = _first_id(wf, ["UNETLoader"])
+    if loader is None:
+        raise ValueError("Head swap graph has no UNETLoader")
+    unet = str(unet_name or HEAD_SWAP_UNET).strip() or HEAD_SWAP_UNET
+    lora = str(lora_name or HEAD_SWAP_LORA).strip() or HEAD_SWAP_LORA
+    try:
+        strength = float(lora_strength)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Head swap LoRA strength must be a number, got {lora_strength!r}") from exc
+    if not isfinite(strength):
+        raise ValueError("Head swap LoRA strength must be a finite number")
+    wf[loader].setdefault("inputs", {})["unet_name"] = unet
+    wf[HEAD_LORA_ID] = {
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {"title": "Head swap LoRA"},
+        "inputs": {
+            "model": [loader, 0],
+            "lora_name": lora,
+            "strength_model": strength,
+        },
+    }
+    rewire_consumers(wf, (loader, 0), (HEAD_LORA_ID, 0), skip_node_ids={HEAD_LORA_ID})
+    wf[FACE_IMAGE_ID].setdefault("inputs", {})["image"] = face
+    wf[BODY_VIDEO_ID].setdefault("inputs", {})["file"] = source
+    wf[BODY_TRIM_ID].setdefault("inputs", {})["length"] = max(1, int(length))
+    guide_inputs = wf[HEAD_GUIDE_ID].setdefault("inputs", {})
+    guide_inputs["frame_idx"] = 0
+    guide_inputs["image"] = [BODY_TRIM_ID, 0]
+    wf[r2v].setdefault("inputs", {})["ref_images.ref_image_0"] = [FACE_IMAGE_ID, 0]
+    return wf
+
+
+def is_character_swap_mode(mode: str | None) -> bool:
+    key = str(mode or "").strip().lower().replace("-", "_")
+    return key in _CHAR_SWAP_MODES
+
+
+def character_swap_prompt(
+    extra: str | None = None,
+    target: str | None = None,
+    reference_description: str | None = None,
+    reference_image_count: int = 1,
+) -> str:
+    """Studio edit instructions, with character appearance separate from the scene."""
+    user = str(extra or "").strip()
+    subject = str(target or "").strip()
+    pictures = " and ".join(f"<Picture {i}>" for i in range(1, max(1, reference_image_count) + 1))
+    description = str(reference_description or "").strip()
+    heading = (
+        "[video editing] Edit <Video 1>. "
+        f"Replace {subject or 'the selected subject'} with the character whose appearance comes from {pictures}, "
+        "starting with the first output frame. Transfer the reference character's identity, face, hair, outfit, "
+        "colors and design into the selected region. Preserve the source performance, timing, camera and "
+        "unrelated scene details. The original subject's appearance must be replaced, including its inverted colors. "
+        + _INVERT_MARK
+    )
+    lowered = user.lower()
+    if lowered.startswith("[video editing]") or ("subject_definitions:" in lowered and "summary:" in lowered):
+        return heading + "\n\n" + user + ("\n\nReference character:\n" + description if description else "")
+    body = user or (
+        "Replace the selected subject with the character shown in <Picture 1>. "
+        "Keep the source performance."
+    )
+    return (
+        heading + "\n\nsubject_definitions:\n"
+        f"<Subject 1> is the replacement character whose appearance comes from {pictures}. "
+        "Transfer its face, hair, outfit, colors and design; ignore the reference poses, backgrounds and framing. "
+        "Multiple views on a character sheet show one character. " + description + "\n"
+        f"<Subject 2> is the source subject to replace in <Video 1>, identified as: {subject or 'the selected subject'}.\n"
+        "<Video 1> supplies the original performance, positions, poses, expressions, timing, camera, lighting and environment.\n\n"
+        "summary:\n"
+        "[video editing + reference generation] Replace <Subject 2> in <Video 1> with <Subject 1> from the first output frame.\n\n"
+        "retention_analysis:\n"
+        f"<Subject 1>: fully_preserved - identity and visible appearance follow {pictures}.\n"
+        "<Video 1>: partially_preserved - retain the performance and scene; replace the selected subject's appearance.\n"
+        "Preserve the source timing, actions, expressions, camera movement and all unrelated scene details. "
+        + _INVERT_MARK + "\n\n"
+        "detailed_description:\n"
+        "[Shot 1] Follow the source subject's position, scale, pose and performance from the first frame. "
+        "Do not begin in a T-pose, display a character sheet, or animate a transition from the reference pose.\n"
+        + body + "\n\n"
+        "overall_soundscape:\nUse the source video's sound.\n\n"
+        "non_diegetic_music:\nDo not add music."
+    )
+
+
+def apply_character_swap(
+    workflow: dict,
+    *,
+    character_image: str,
+    source_video: str,
+    length: int,
+    sam_target: str,
+    sam3_checkpoint: str | None = None,
+    unet_name: str | None = None,
+    lora_name: str | None = None,
+    lora_strength: float = CHAR_LORA_STRENGTH,
+    vae_name: str | None = None,
+    shift_video: float = CHAR_SHIFT_VIDEO,
+    steps: int = CHAR_STEPS,
+    reference_images: list[str] | None = None,
+) -> dict:
+    """Point character swap at the Studio Ref2VA/V4 preset and appearance stills.
+
+    Native SAM3 tracks the phrase. ``ImageInvert`` plus ``ImageCompositeMasked``
+    flips colors only inside that mask. The still is ``<Picture 1>`` and the
+    treated frames are ``<Video 1>``. Source audio is not fed in. This mode
+    does not use the FL2VA UNET or PDD Acc: the V4 turbo LoRA sits on Ref2VA,
+    sigma shift is 6, and the sampler is 8-step ``res_multistep``.
+    """
+    still = str(character_image or "").strip()
+    source = str(source_video or "").strip()
+    target = str(sam_target or "").strip()
+    ckpt = SAM3_CHECKPOINT if sam3_checkpoint is None else str(sam3_checkpoint).strip()
+    if not still:
+        raise ValueError("Character swap needs a character still for <Picture 1>")
+    if not source:
+        raise ValueError("Character swap needs a source clip for <Video 1>")
+    if not target:
+        raise ValueError("Character swap needs a SAM3 target (who to replace in the source clip)")
+    if not ckpt:
+        raise ValueError(
+            "Character swap needs a SAM3 checkpoint in models/checkpoints "
+            f"(video.sam3_checkpoint). The usual file is {SAM3_CHECKPOINT}."
+        )
+    wf = deepcopy(workflow)
+    expected = {
+        CHAR_IMAGE_ID: "LoadImage",
+        BODY_VIDEO_ID: "LoadVideo",
+        BODY_VC_ID: "GetVideoComponents",
+        BODY_TRIM_ID: "ImageFromBatch",
+        CHAR_SAM_ID: "CheckpointLoaderSimple",
+        CHAR_TEXT_ID: "CLIPTextEncode",
+        CHAR_TRACK_ID: "SAM3_VideoTrack",
+        CHAR_MASK_ID: "SAM3_TrackToMask",
+        CHAR_INVERT_ID: "ImageInvert",
+        CHAR_TREAT_ID: "ImageCompositeMasked",
+    }
+    for nid, kind in expected.items():
+        node = wf.get(nid)
+        if not isinstance(node, dict) or node.get("class_type") != kind:
+            raise ValueError(f"Character swap graph is missing {kind} node {nid}")
+    r2v = _first_id(wf, [R2V_NODE])
+    if r2v is None:
+        raise ValueError("Character swap graph has no MiniMaxH3ReferenceToVideo node")
+    wf[CHAR_IMAGE_ID].setdefault("inputs", {})["image"] = still
+    wf[BODY_VIDEO_ID].setdefault("inputs", {})["file"] = source
+    wf[BODY_TRIM_ID].setdefault("inputs", {})["length"] = max(1, int(length))
+    wf[CHAR_SAM_ID].setdefault("inputs", {})["ckpt_name"] = ckpt
+    text_inputs = wf[CHAR_TEXT_ID].setdefault("inputs", {})
+    text_inputs["text"] = target
+    text_inputs["clip"] = [CHAR_SAM_ID, 1]
+    track_inputs = wf[CHAR_TRACK_ID].setdefault("inputs", {})
+    track_inputs["images"] = [BODY_TRIM_ID, 0]
+    track_inputs["model"] = [CHAR_SAM_ID, 0]
+    track_inputs["conditioning"] = [CHAR_TEXT_ID, 0]
+    mask_inputs = wf[CHAR_MASK_ID].setdefault("inputs", {})
+    mask_inputs["track_data"] = [CHAR_TRACK_ID, 0]
+    mask_inputs["object_indices"] = ""
+    wf[CHAR_INVERT_ID].setdefault("inputs", {})["image"] = [BODY_TRIM_ID, 0]
+    treat = wf[CHAR_TREAT_ID].setdefault("inputs", {})
+    treat["destination"] = [BODY_TRIM_ID, 0]
+    treat["source"] = [CHAR_INVERT_ID, 0]
+    treat["x"] = 0
+    treat["y"] = 0
+    treat["resize_source"] = False
+    treat["mask"] = [CHAR_MASK_ID, 0]
+    r2v_inputs = wf[r2v].setdefault("inputs", {})
+    for key in list(r2v_inputs):
+        if key.split(".", 1)[0] in {"ref_images", "ref_videos", "ref_video_audios", "ref_audios"}:
+            r2v_inputs.pop(key)
+    _prune_helper_prefix(wf, REF_IMAGE_PREFIX, set())
+    r2v_inputs["ref_images.ref_image_0"] = [CHAR_IMAGE_ID, 0]
+    extras = list(reference_images or [])
+    if len(extras) >= MAX_REF_IMAGES:
+        raise ValueError(f"Character swap accepts at most {MAX_REF_IMAGES - 1} additional appearance images")
+    for idx, key in enumerate(extras, 1):
+        nid = f"{REF_IMAGE_PREFIX}{idx}"
+        wf[nid] = {"class_type": "LoadImage", "inputs": {"image": key}}
+        r2v_inputs[f"ref_images.ref_image_{idx}"] = [nid, 0]
+    r2v_inputs["ref_videos.ref_video_0"] = [CHAR_TREAT_ID, 0]
+    r2v_inputs["length"] = max(1, int(length))
+    try:
+        strength = float(lora_strength)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Character swap LoRA strength must be a number, got {lora_strength!r}") from exc
+    if not isfinite(strength):
+        raise ValueError("Character swap LoRA strength must be a finite number")
+    unet_id = _first_id(wf, ["UNETLoader"])
+    if unet_id is None:
+        raise ValueError("Character swap graph has no UNETLoader")
+    shift_id = _first_id(wf, [SHIFT_NODE])
+    if shift_id is None:
+        raise ValueError("Character swap graph has no MiniMaxH3SigmaShift")
+    unet = str(unet_name or CHAR_UNET).strip() or CHAR_UNET
+    lora = str(lora_name or CHAR_LORA).strip() or CHAR_LORA
+    vae = str(vae_name or CHAR_VAE).strip() or CHAR_VAE
+    wf[unet_id].setdefault("inputs", {})["unet_name"] = unet
+    vae_ref = link_ref(r2v_inputs.get("vae"))
+    if not vae_ref or wf.get(vae_ref[0], {}).get("class_type") != "VAELoader":
+        raise ValueError("Character swap needs a video VAELoader connected to reference conditioning")
+    wf[vae_ref[0]].setdefault("inputs", {})["vae_name"] = vae
+    wf[CHAR_LORA_ID] = {
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {"title": "Ref2V turbo"},
+        "inputs": {
+            "model": [unet_id, 0],
+            "lora_name": lora,
+            "strength_model": strength,
+        },
+    }
+    shift_inputs = wf[shift_id].setdefault("inputs", {})
+    shift_inputs["model"] = [CHAR_LORA_ID, 0]
+    shift_inputs["shift_video"] = CHAR_SHIFT_VIDEO
+    shift_inputs["shift_audio"] = SHIFT_AUDIO
+    acc_id = _first_id(wf, [ACC_NODE])
+    if acc_id:
+        rewire_consumers(wf, (acc_id, 0), (shift_id, 0), skip_node_ids={acc_id})
+        wf.pop(acc_id, None)
+    guider_id = _first_id(wf, ["BasicGuider", "CFGGuider"])
+    if guider_id is None:
+        raise ValueError("Character swap graph has no guider for reference conditioning")
+    wf[guider_id]["class_type"] = "BasicGuider"
+    wf[guider_id]["inputs"] = {"model": [shift_id, 0], "conditioning": [r2v, 0]}
+    scheduler_id = _first_id(wf, ["BasicScheduler"])
+    if scheduler_id is None:
+        raise ValueError("Character swap graph has no BasicScheduler")
+    sched = wf[scheduler_id].setdefault("inputs", {})
+    sched["model"] = [shift_id, 0]
+    sched["steps"] = CHAR_STEPS
+    sched["scheduler"] = "simple"
+    sched["denoise"] = 1.0
+    samplers = nodes_of_type(wf, ["SamplerCustomAdvanced"])
+    if not samplers:
+        raise ValueError("Character swap graph has no SamplerCustomAdvanced")
+    for nid, sampler in samplers:
+        sampler_inputs = sampler.setdefault("inputs", {})
+        sampler_inputs["guider"] = [guider_id, 0]
+        sampler_inputs["sigmas"] = [scheduler_id, 0]
+        sampler_inputs["latent_image"] = [r2v, 1]
+        # Studio decodes the model's denoised prediction, not the integrator output.
+        rewire_consumers(wf, (nid, 0), (nid, 1), skip_node_ids={nid})
+    for _nid, select in nodes_of_type(wf, ["KSamplerSelect"]):
+        select.setdefault("inputs", {})["sampler_name"] = CHAR_SAMPLER
+    for _nid, decode in nodes_of_type(wf, ["VAEDecode", "VAEDecodeTiled"]):
+        decode["class_type"] = "VAEDecodeTiled"
+        decode_inputs = decode.setdefault("inputs", {})
+        decode_inputs["samples"] = [samplers[0][0], 1]
+        decode_inputs["vae"] = [vae_ref[0], vae_ref[1]]
+        decode_inputs["tile_size"] = 512
+        decode_inputs["overlap"] = 64
+        decode_inputs["temporal_size"] = 32
+        decode_inputs["temporal_overlap"] = 8
+    for _nid, decode in nodes_of_type(wf, ["VAEDecodeAudio"]):
+        decode.setdefault("inputs", {})["samples"] = [samplers[0][0], 1]
+    return wf
+
+
+def finish_swap_video(workflow: dict, *, frames: int) -> dict:
+    """Remove H3 padding and retain the selected source clip's soundtrack."""
+    wf = deepcopy(workflow)
+    if CHAR_IMAGE_ID in wf:
+        # Save/upscale helpers are inserted after apply_character_swap; they
+        # must use the same denoised prediction as the Character Swap decoder.
+        for nid, _sampler in nodes_of_type(wf, ["SamplerCustomAdvanced"]):
+            rewire_consumers(wf, (nid, 0), (nid, 1), skip_node_ids={nid})
+    video_id = _first_id(wf, ["CreateVideo"])
+    if video_id is None or BODY_VC_ID not in wf:
+        raise ValueError("Swap graph needs CreateVideo and source video components")
+    inputs = wf[video_id].setdefault("inputs", {})
+    output_image = inputs["images"]
+    if CHAR_IMAGE_ID in wf:
+        decode_id = _first_id(wf, ["VAEDecode", "VAEDecodeTiled"])
+        if decode_id is None:
+            raise ValueError("Character swap graph has no video decoder")
+        output_image = [decode_id, 0]
+    wf["h3_output_trim"] = {
+        "class_type": "ImageFromBatch",
+        "_meta": {"title": "Return the selected source duration"},
+        "inputs": {"image": output_image, "batch_index": 0, "length": int(frames)},
+    }
+    inputs["images"] = ["h3_output_trim", 0]
+    inputs["audio"] = [BODY_VC_ID, 1]
+    inputs["fps"] = 24.0
     return wf

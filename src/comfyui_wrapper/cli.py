@@ -42,6 +42,9 @@ def _cfg(args) -> WrapperConfig:
             "canny_low": getattr(args, "anima_canny_low", 0.4),
             "canny_high": getattr(args, "anima_canny_high", 0.8),
         }]
+    inpaint_enable = getattr(args, "inpaint_enable", None)
+    if getattr(args, "inpaint_mask", None) or getattr(args, "inpaint_image", None):
+        inpaint_enable = True if inpaint_enable is None else inpaint_enable
     return apply_overrides(
         cfg,
         host=getattr(args, "host", None),
@@ -60,6 +63,13 @@ def _cfg(args) -> WrapperConfig:
         filename_prefix=getattr(args, "prefix", None),
         workflow_file=getattr(args, "workflow", None),
         anima_lllite=anima_lllite,
+        inpaint_enable=inpaint_enable,
+        inpaint_image=getattr(args, "inpaint_image", None),
+        inpaint_mask=getattr(args, "inpaint_mask", None),
+        inpaint_denoise=getattr(args, "inpaint_denoise", None),
+        inpaint_grow=getattr(args, "inpaint_grow", None),
+        inpaint_blur=getattr(args, "inpaint_blur", None),
+        inpaint_invert=getattr(args, "inpaint_invert", None),
         skip_exists=getattr(args, "skip_exists", None),
         random_count=getattr(args, "random_count", None),
         batch_count=getattr(args, "batch_count", None),
@@ -92,6 +102,23 @@ def _add_gen(p: argparse.ArgumentParser) -> None:
         dest="init_image",
         help="Init image for img2img (local path or ComfyUI input key)",
     )
+    p.add_argument(
+        "--inpaint-image",
+        dest="inpaint_image",
+        default=None,
+        help="Init image for inpaint (defaults to --init-image when empty)",
+    )
+    p.add_argument(
+        "--inpaint-mask",
+        dest="inpaint_mask",
+        default=None,
+        help="White-on-black mask for inpaint (white = repaint; enables inpaint)",
+    )
+    p.add_argument("--inpaint-denoise", dest="inpaint_denoise", type=float, default=None)
+    p.add_argument("--inpaint-grow", dest="inpaint_grow", type=int, default=None)
+    p.add_argument("--inpaint-blur", dest="inpaint_blur", type=int, default=None)
+    p.add_argument("--inpaint-invert", dest="inpaint_invert", action="store_true", default=None)
+    p.add_argument("--no-inpaint", dest="inpaint_enable", action="store_false", default=None)
     p.add_argument("--prefix", help="SaveImage filename_prefix")
     p.add_argument("--anima-control-image", help="Preprocessed Anima control map")
     p.add_argument(
@@ -405,6 +432,8 @@ def cmd_bindings(args) -> int:
         if has_sampler and has_latent and has_vae:
             print("  init_image         -> img2img_loader.image  (LoadImage, injected when --init-image is set)")
             print("                       img2img_scale.width/height follow Width/Height; KSampler.denoise = strength")
+            print("  inpaint_mask       -> inpaint_mask_loader.image  (LoadImage, injected when --inpaint-mask is set)")
+            print("                       white = repaint via SetLatentNoiseMask; --inpaint-grow/--inpaint-blur feather it")
     return 0
 
 
@@ -422,6 +451,7 @@ def cmd_video(args) -> int:
             ref_videos=getattr(args, "ref_video", None),
             ref_audios=getattr(args, "ref_audio", None),
             ref_image_size=getattr(args, "ref_image_size", None),
+            include_reference_video_audio=False if getattr(args, "no_ref_video_audio", False) else None,
             seed=getattr(args, "seed", None),
             steps=getattr(args, "steps", None),
             width=getattr(args, "width", None),
@@ -434,9 +464,136 @@ def cmd_video(args) -> int:
             audio_vae=getattr(args, "audio_vae", None),
             recipe=getattr(args, "recipe", None),
             acc_file=getattr(args, "acc_file", None),
+            size_megapixels=getattr(args, "size_megapixels", None),
             loop=False if getattr(args, "no_loop", False) else None,
+            sam_target=getattr(args, "sam_target", None),
+            sam3_checkpoint=getattr(args, "sam3_checkpoint", None),
+            source_start=getattr(args, "source_start", None),
+            source_end=getattr(args, "source_end", None),
+            reference_description=getattr(args, "reference_description", None),
             latent_upscale=True if getattr(args, "latent_upscale", False) else None,
             rtx_vsr=True if getattr(args, "rtx_vsr", False) else None,
+            save_latents=False if getattr(args, "no_save_latents", False) else (
+                True if getattr(args, "save_latents", False) else None
+            ),
+            filename_prefix=getattr(args, "prefix", None),
+            cfg=cfg,
+            wait=not args.no_wait,
+            dump_path=getattr(args, "dump_workflow", None),
+        )
+    except (ComfyError, FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"prompt_id: {result.prompt_id}")
+    print(f"seed:      {result.seed}")
+    for path in result.saved_files:
+        print(f"saved:     {path}")
+    return 0
+
+
+def cmd_upscale(args) -> int:
+    from pathlib import Path as _Path
+
+    from comfyui_wrapper.video import upscale_dropped_file
+    from comfyui_wrapper.workflow import dump_workflow as _dump
+
+    cfg = _cfg(args)
+    client = ComfyClient(cfg=cfg)
+    if not client.ping():
+        print(f"error: ComfyUI is not reachable at {cfg.comfyui.base_url}", file=sys.stderr)
+        return 1
+    source = _Path(args.source)
+    dest = _Path(args.out) if getattr(args, "out", None) else None
+    if getattr(args, "dump_workflow", None) and getattr(args, "no_wait", False):
+        # Dump the graph without queueing: build via the same helpers.
+        from comfyui_wrapper.h3 import (
+            detect_upscale_kind,
+            latent_upscale_graph,
+            resolve_dropped_latent_pair,
+            rtx_vsr_graph,
+        )
+        from comfyui_wrapper.video import stage_latent_file, stage_input_video
+
+        kind = args.mode if args.mode != "auto" else detect_upscale_kind(source)
+        if kind == "latent":
+            explicit_audio = getattr(args, "audio_latent", None)
+            if explicit_audio:
+                video_p, audio_p = source, _Path(explicit_audio)
+            else:
+                video_p, audio_p = resolve_dropped_latent_pair([source])
+            if video_p is None:
+                print(f"error: Latent not found: {source}", file=sys.stderr)
+                return 1
+            key = stage_latent_file(video_p, client=client, cfg=cfg)
+            audio_key = (
+                stage_latent_file(audio_p, client=client, cfg=cfg)
+                if audio_p is not None and _Path(audio_p).is_file()
+                else None
+            )
+            wf = latent_upscale_graph(
+                key,
+                (dest.stem if dest else source.stem + "__latent2x"),
+                audio_latent_key=audio_key,
+                vae=cfg.video.vae,
+                audio_vae=cfg.video.audio_vae,
+                model_name=cfg.video.latent_upscale_model,
+                scale=cfg.video.latent_upscale_scale,
+                fps=cfg.video.fps,
+            )
+        else:
+            key = stage_input_video(source, client=client, cfg=cfg)
+            wf = rtx_vsr_graph(
+                key,
+                (dest.stem if dest else source.stem + "__rtx"),
+                scale=cfg.video.rtx_vsr_scale,
+                quality=cfg.video.rtx_vsr_quality,
+            )
+        _dump(wf, args.dump_workflow)
+        print(f"wrote {args.dump_workflow} ({kind})")
+        return 0
+    try:
+        out, kind = upscale_dropped_file(
+            source,
+            dest,
+            mode=getattr(args, "mode", "auto"),
+            audio_source=getattr(args, "audio_latent", None),
+            client=client,
+            cfg=cfg,
+        )
+    except (ComfyError, FileNotFoundError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"kind:      {kind}")
+    print(f"saved:     {out}")
+    return 0
+
+
+def cmd_qwen(args) -> int:
+    from comfyui_wrapper.qwen_image import generate_qwen
+
+    cfg = _cfg(args)
+    images = list(getattr(args, "image", None) or [])
+    try:
+        result = generate_qwen(
+            prompt=getattr(args, "prompt", None),
+            negative=getattr(args, "negative", None),
+            images=images or None,
+            mode=getattr(args, "mode", None),
+            seed=getattr(args, "seed", None),
+            steps=getattr(args, "steps", None),
+            cfg_scale=getattr(args, "cfg_scale", None),
+            width=getattr(args, "width", None),
+            height=getattr(args, "height", None),
+            sampler=getattr(args, "sampler", None),
+            scheduler=getattr(args, "scheduler", None),
+            batch_size=getattr(args, "batch_size", None),
+            unet=getattr(args, "unet", None),
+            clip=getattr(args, "clip", None),
+            vae=getattr(args, "vae", None),
+            resolution=getattr(args, "resolution", None),
+            match_reference=getattr(args, "match_reference", None),
+            cache_device=getattr(args, "cache_device", None),
+            cache_dtype=getattr(args, "cache_dtype", None),
             filename_prefix=getattr(args, "prefix", None),
             cfg=cfg,
             wait=not args.no_wait,
@@ -455,6 +612,35 @@ def cmd_video(args) -> int:
 def cmd_ui(args) -> int:
     from comfyui_wrapper.webui import launch_from_args
     return launch_from_args(args)
+
+
+def cmd_tts(args) -> int:
+    from comfyui_wrapper.tts import VoiceCloneError, clone_voice, installation_status
+
+    cfg = _cfg(args)
+    if args.check:
+        status = installation_status(cfg)
+        print(status)
+        return 0 if status.startswith("Ready") else 1
+    try:
+        result = clone_voice(
+            args.text, args.reference, cfg=cfg, reference_text=args.reference_text,
+            mode="voice_only" if args.voice_only else "continuation",
+            language=args.language, steps=args.steps, seed=args.seed,
+            guidance_scale=args.guidance_scale,
+            max_seconds=args.max_seconds, output=args.output,
+            on_progress=lambda message: print(message, flush=True),
+        )
+    except (VoiceCloneError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Voice clone stopped.", file=sys.stderr)
+        return 130
+    print(f"saved: {result.audio}")
+    print(f"details: {result.metadata}")
+    print(f"seed: {result.seed}; duration: {result.duration:.2f}s; peak model VRAM: {result.peak_vram_gb:.2f} GB")
+    return 0
 
 
 def cmd_list_configs(args) -> int:
@@ -485,29 +671,46 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--dump-workflow", help="Write the patched API workflow JSON to this path")
     g.set_defaults(func=cmd_generate)
 
-    vid = sub.add_parser("video", help="MiniMax H3 image-to-video loop (sd-comic-ext ambient graph)")
+    vid = sub.add_parser("video", help="MiniMax H3 frame animation, appearance references, or source-video swaps")
     _add_global(vid)
-    _add_gen(vid)
-    vid.add_argument("--image", required=False, default=None, help="First-frame still (I2V/FLF2V; doubles as <Picture 1> in R2V when no --ref-image)")
-    vid.add_argument("--last-frame", dest="last_frame", default=None, help="End still for first+last-frame interpolation (I2V only, FL2VA)")
+    vid.add_argument("--checkpoint", help="Compatible H3 checkpoint; the workflow chooses its model family")
+    vid.add_argument("--steps", type=int, help="Base quality steps; acceleration and swap presets fix their own step count")
+    vid.add_argument("--width", type=int)
+    vid.add_argument("--height", type=int)
+    vid.add_argument("--seed", type=int, help="Seed; -1 for random")
+    vid.add_argument("--prefix", help="Output filename prefix")
+    vid.add_argument("--image", required=False, default=None, help="Start frame for i2v/r2v_frames; primary appearance picture for r2v; replacement face/character for swaps")
+    vid.add_argument("--last-frame", dest="last_frame", default=None, help="End-frame anchor for i2v or r2v_frames")
     vid.add_argument(
         "--mode",
-        choices=["i2v", "r2v"],
+        choices=["i2v", "r2v", "r2v_frames", "headswap", "charswap", "t2v"],
         default=None,
-        help="i2v = ImageToVideo (+ optional --last-frame); r2v = ReferenceToVideo lite on FL2VA (auto when any --ref-* is given)",
+        help="i2v = FL2VA start/end frames; r2v = Ref2VA appearance/motion/audio references; r2v_frames = references plus separate start/end guides; swaps = one replacement and one source clip; t2v = text alone",
+    )
+    vid.add_argument("--sam-target", dest="sam_target", default=None, help="Character swap: who SAM3 should replace, for example \"the person\"")
+    vid.add_argument(
+        "--sam3-checkpoint",
+        dest="sam3_checkpoint",
+        default=None,
+        help="Character swap: SAM3.1 checkpoint filename in models/checkpoints",
     )
     vid.add_argument("--ref-image", dest="ref_image", action="append", default=[], help="Reference still (<Picture i>, repeatable, max 9)")
     vid.add_argument("--ref-video", dest="ref_video", action="append", default=[], help="Reference clip, mp4 (<Video k>, repeatable, max 3)")
     vid.add_argument("--ref-audio", dest="ref_audio", action="append", default=[], help="Reference audio clip (<Audio j>, repeatable, max 3)")
+    vid.add_argument("--no-ref-video-audio", action="store_true", help="Use reference video visuals without their soundtrack")
+    vid.add_argument("--source-start", type=float, default=None, help="Swap source trim start in seconds")
+    vid.add_argument("--source-end", type=float, default=None, help="Swap source trim end in seconds; 0 uses the whole clip")
+    vid.add_argument("--reference-description", default=None, help="Character appearance, separate from the scene and motion prompt")
     vid.add_argument("--ref-image-size", dest="ref_image_size", choices=["match", "max"], default=None)
     vid.add_argument("--prompt", "-p", help="Motion prompt")
-    vid.add_argument("--frames", type=int, help="Frame count at 24 fps (124 ≈ 5s)")
-    vid.add_argument("--fps", type=int)
+    vid.add_argument("--frames", type=int, help="Frame count at 24 fps; swap modes interpret this as trim duration unless --source-end is set")
+    vid.add_argument("--fps", type=int, choices=[24], help="H3's fixed generation frame rate")
+    vid.add_argument("--size-megapixels", type=float, help="Generation resolution when matching input aspect ratio")
     vid.add_argument("--audio-vae", help="MiniMax H3 audio VAE filename")
     vid.add_argument(
         "--recipe",
-        choices=["native", "acc"],
-        help="native = 12-step res_multistep (no Acc file); acc = 8-step PDD Acc (euler + Acc-8Step weights)",
+        choices=["native", "acc", "acc4", "ref_native", "ref_turbo4", "ref_turbo8"],
+        help="native/ref_native = adjustable quality steps; Acc and reference Turbo presets use fixed steps and matching weights; swaps select their preset automatically",
     )
     vid.add_argument("--acc-file", dest="acc_file", help="PDD Acc file in models/pdd_acc (not a LoRA)")
     vid.add_argument("--no-loop", action="store_true", help="Skip cyclic crossfade")
@@ -521,9 +724,41 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Post-process 2x via NVIDIA RTXVideoSuperResolution",
     )
+    vid.add_argument(
+        "--save-latents",
+        dest="save_latents",
+        action="store_true",
+        default=None,
+        help="Save the sampled AV latent (.latent) for decode-only 2x in the Upscale tab",
+    )
+    vid.add_argument(
+        "--no-save-latents",
+        dest="no_save_latents",
+        action="store_true",
+        help="Do not save AV latents",
+    )
     vid.add_argument("--no-wait", action="store_true")
     vid.add_argument("--dump-workflow", help="Write the patched API workflow JSON")
     vid.set_defaults(func=cmd_video)
+
+    up = sub.add_parser("upscale", help="Upscale a saved .latent (3D 2x) or rendered clip (RTX VSR)")
+    _add_global(up)
+    up.add_argument("source", help="Local .latent/.safetensors (3D 2x) or .mp4/.webm/.mov/.mkv (RTX VSR)")
+    up.add_argument("--out", "-o", default=None, help="Output mp4 path (default: <stem>__latent2x/__rtx.mp4)")
+    up.add_argument(
+        "--mode",
+        choices=["auto", "latent", "rtx"],
+        default="auto",
+        help="auto picks from the file suffix (single check); latent = 3D 2x decode-only; rtx = RTX VSR post pass",
+    )
+    up.add_argument("--no-wait", action="store_true")
+    up.add_argument("--dump-workflow", help="Write the upscale API workflow JSON")
+    up.add_argument(
+        "--audio-latent",
+        default=None,
+        help="Explicit *_audio.latent half (otherwise the *_audio sibling next to <source> is used)",
+    )
+    up.set_defaults(func=cmd_upscale)
 
     def _add_batch_sel(p):
         _add_global(p)
@@ -586,6 +821,53 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("configs", help="List zone and prompt config names")
     _add_global(ls)
     ls.set_defaults(func=cmd_list_configs)
+
+    qw = sub.add_parser("qwen", help="Qwen Image 2.1 text-to-image or reference-image edit")
+    _add_global(qw)
+    qw.add_argument("--prompt", "-p", help="Prompt (edit instruction when --image is set)")
+    qw.add_argument("--negative", "-n", help="Negative prompt")
+    qw.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="Reference image for an edit (repeatable, max 10). Implies edit mode.",
+    )
+    qw.add_argument("--mode", choices=["txt2img", "edit"], default=None)
+    qw.add_argument("--steps", type=int)
+    qw.add_argument("--cfg-scale", dest="cfg_scale", type=float)
+    qw.add_argument("--sampler")
+    qw.add_argument("--scheduler")
+    qw.add_argument("--width", type=int)
+    qw.add_argument("--height", type=int)
+    qw.add_argument("--seed", type=int, help="Seed; -1 for random")
+    qw.add_argument("--batch-size", dest="batch_size", type=int)
+    qw.add_argument("--unet", help="Qwen Image 2.1 UNET or GGUF filename")
+    qw.add_argument("--clip", help="Qwen3-VL text encoder filename")
+    qw.add_argument("--vae", help="Qwen Image 2.1 VAE filename")
+    qw.add_argument("--resolution", type=int, help="Reference resize. 0 keeps each image size.")
+    qw.add_argument("--match-reference", dest="match_reference", action="store_const", const=True, default=None)
+    qw.add_argument("--no-match-reference", dest="match_reference", action="store_const", const=False, default=None)
+    qw.add_argument("--cache-device", dest="cache_device", choices=["auto", "gpu", "cpu", "off"])
+    qw.add_argument("--cache-dtype", dest="cache_dtype", choices=["default", "int8", "int4"])
+    qw.add_argument("--prefix", help="SaveImage filename_prefix")
+    qw.add_argument("--no-wait", action="store_true")
+    qw.add_argument("--dump-workflow", help="Write the patched API workflow JSON")
+    qw.set_defaults(func=cmd_qwen)
+
+    tts = sub.add_parser("tts", help="Clone a voice locally with dots.tts-SOAR")
+    _add_global(tts)
+    tts.add_argument("--check", action="store_true", help="Check the local runtime and model files")
+    tts.add_argument("--text", help="New words to speak")
+    tts.add_argument("--reference", help="Short reference recording (3–10 seconds recommended)")
+    tts.add_argument("--reference-text", default="", help="Exact words spoken in the reference")
+    tts.add_argument("--voice-only", action="store_true", help="Clone timbre without a reference transcript")
+    tts.add_argument("--language", default="EN", help="Language code or auto_detect")
+    tts.add_argument("--steps", type=int, default=10, help="Flow sampling steps / NFE (10–32; default: 10)")
+    tts.add_argument("--guidance-scale", type=float, default=1.2, help="CFG strength (0–3; default: 1.2)")
+    tts.add_argument("--seed", type=int, default=-1)
+    tts.add_argument("--max-seconds", type=float, default=25)
+    tts.add_argument("--output", type=Path, help="New WAV output path (existing files are preserved)")
+    tts.set_defaults(func=cmd_tts)
 
     ui = sub.add_parser("ui", help="Launch the A1111-style Gradio WebUI")
     ui.add_argument("--config", "-c", help="Path to config.yaml")

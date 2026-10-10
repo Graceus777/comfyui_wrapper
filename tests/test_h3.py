@@ -164,7 +164,7 @@ def test_native_does_not_inject_acc(repo_root):
     assert wf["7"]["inputs"]["model"] == ["16", 0]
     assert wf["11"]["inputs"]["sigmas"] == ["10", 0]
     assert wf["9"]["inputs"]["sampler_name"] == "res_multistep"
-    assert wf["10"]["inputs"]["steps"] == 12
+    assert wf["10"]["inputs"]["steps"] == 20
     assert wf["16"]["inputs"]["shift_video"] == 12.0
 
 
@@ -175,7 +175,7 @@ def test_native_disables_existing_acc(repo_root):
     assert wf["h3_acc"]["inputs"]["bypass_sigmas"] == ["10", 0]
     assert wf["11"]["inputs"]["sigmas"] == ["10", 0]
     assert wf["9"]["inputs"]["sampler_name"] == "res_multistep"
-    assert wf["10"]["inputs"]["steps"] == 12
+    assert wf["10"]["inputs"]["steps"] == 20
 
 
 def test_h3recipe_object_does_not_snap_native_to_acc(repo_root):
@@ -193,7 +193,7 @@ def test_h3recipe_object_does_not_snap_native_to_acc(repo_root):
         recipe=rec,
     )
     assert stack["recipe"].key == "native"
-    assert stack["steps"] == 12
+    assert stack["steps"] == 20
     assert stack["sampler"] == "res_multistep"
     wf = apply_h3_graph(_bundled(repo_root), recipe=stack["recipe"], steps=12)
     assert wf["10"]["inputs"]["steps"] == 12
@@ -214,7 +214,7 @@ def test_video_recipe_ui_clears_acc_on_native():
         "MiniMax-H3-FL2VA-Acc-8Step.safetensors",
     )
     assert rec.key == "native"
-    assert steps == 12
+    assert steps == 20
     assert acc == ""
     rec, steps, acc = video_recipe_ui(
         "acc",

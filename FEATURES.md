@@ -3,11 +3,26 @@
 `comfyui_wrapper` is a config-driven Python client and local WebUI for a
 running ComfyUI server. It keeps the authored workflow graph in API-format
 JSON and applies run-specific settings by patching a copy of that graph. It
-does not download models or install ComfyUI custom nodes.
+does not automatically download models or install ComfyUI custom nodes.
+An explicit, opt-in setup script installs the pinned dependencies for the
+[dedicated workflow tools](workflows/containers/README.md).
 
 This document describes the capabilities implemented in the current source.
 The matching ComfyUI nodes, model files, and optional command-line tools must
 already be available in the environment where a job runs.
+
+## Local voice cloning
+
+- Dedicated **Voice Clone** tab and `comfywrap tts` CLI with dots.tts-SOAR.
+- Best-match continuation from reference audio plus its exact transcript, or
+  audio-only speaker cloning. Clean 3–10 second recordings are recommended.
+- Local mono 48 kHz WAV output, retained reference, generation settings,
+  timing, GPU memory measurements, and worker log.
+- Isolated Python 3.12/CUDA runtime, offline generation after explicit setup,
+  cancellation, and GPU model release at the end of each request.
+- Idle ComfyUI model caches can be released before cloning; active or queued
+  ComfyUI jobs block a new clone until they finish.
+- [Setup and limitations](docs/voice-clone.md).
 
 ## Core ComfyUI client
 
@@ -51,8 +66,13 @@ already be available in the environment where a job runs.
   automatically, resized to the requested canvas, VAE-encoded, optionally
   repeated for batch generation, and connected to the first sampler with the
   requested denoise strength.
-- Idempotent img2img graph injection and a helper to clear the injected graph
-  back to its original empty-latent input.
+- A1111-style whole-picture inpainting: white mask = repaint via
+  `LoadImage -> ImageScale -> ImageToMask -> GrowMaskWithBlur ->
+  SetLatentNoiseMask` (with optional `InvertMask` for inpaint-not-masked).
+  Idempotent `inpaint_*` nodes reuse the img2img init chain and work on SDXL,
+  Anima, Krea 2, and Flux GGUF without an inpaint model.
+- Idempotent img2img/inpaint graph injection and helpers to clear the injected
+  graph back to its original empty-latent input.
 - Img2img support for the bundled SDXL, Anima, Krea 2, and Flux GGUF graph
   shapes, including graphs whose VAE comes from a standalone `VAELoader`.
 - A1111-style Hires. fix as a second sampling pass, using either latent
@@ -141,17 +161,41 @@ already be available in the environment where a job runs.
 ## MiniMax H3 video
 
 - Bundled H3 image-to-video workflow with synchronized video and audio output.
-- I2V mode requires a first-frame still and supports automatic aspect-preserving
+- I2V mode requires a start and/or end still and supports automatic aspect-preserving
   sizing on H3's 32-pixel grid.
 - Optional first-plus-last-frame interpolation (FLF2V) for the H3 I2V graph;
   the last frame is resized to the same canvas as the first frame.
-- R2V-lite mode uses the native `MiniMaxH3ReferenceToVideo` node with the
-  existing FL2VA UNET, avoiding a separate Ref2VA model download.
-- R2V-lite accepts up to 9 still references, 3 reference videos, and 3
+- Reference generation uses `MiniMaxH3ReferenceToVideo` with the Ref2VA UNET.
+  Appearance images do not become start frames. A separate reference-plus-frame
+  workflow chains `MiniMaxH3AddGuide` at frame 0 and/or -1 while retaining
+  appearance references and the base latent.
+- Reference generation accepts up to 9 still references, 3 reference videos, and 3
   reference audio files. Video references expose both frames and their
   soundtrack to the conditioning node.
 - R2V reference sizing supports `match` for faster input matching and `max` for
   the larger identity-preserving reference size.
+- Head swap mode loads the regular `minimax_h3_fl2va_pruned_w4a8_mixed` UNET
+  and Alissonerdx `minimax_h3_head_swap_v1.0_r32` as a separate LoRA (trigger
+  `head_swap:`). `video.head_swap_lora` and `video.head_swap_strength` select
+  the LoRA and its strength, which defaults to 1.0. The face still is
+  `<Picture 1>` on `MiniMaxH3ReferenceToVideo`. The source clip is an aligned
+  `MiniMaxH3AddGuide` at frame 0 (`<Video 1>`). The LoRA precedes sigma shift
+  and PDD Acc; turbo and other distill LoRAs are stripped with Acc enabled.
+- Character swap loads Ref2VA int8
+  (`minimax_h3_ref2va_pruned_int8_convrot`) and Turbo V4 Step600 pruned, matching
+  the [published Studio preset](https://github.com/BiggerFishy/comfyui-minimax-h3-studio).
+  SAM3 tracks the named subject, `ImageInvert` and `ImageCompositeMasked` flip
+  colors inside that mask, and `MiniMaxH3ReferenceToVideo` takes the
+  replacement still as `<Picture 1>` and the treated frames as `<Video 1>`.
+  Sigma shift is 6, the sampler is 8-step `res_multistep`, and decode is tiled.
+  This mode does not use the FL2VA UNET or PDD Acc. Head swap still does.
+- Swap source clips are selected by start/end seconds and converted to 24 fps
+  without changing playback speed. The last frame is padded to H3's `17n+5`
+  grid, then removed from the delivered output. The original trimmed audio
+  is retained and cyclic crossfade is disabled. The default trim is the first
+  three seconds; end `0` uses the whole remaining clip. Character swap follows
+  the source aspect at 0.8 MP, with separate scene instructions and optional
+  replacement appearance details. Only generated outputs are downloaded.
 - The R2V prompt can use `<Picture i>`, `<Video k>`, and `<Audio j>` references
   to describe identity, motion, and voice sources.
 - Automatically coerces the selected H3 UNET, Qwen text encoder, video VAE,
@@ -159,6 +203,10 @@ already be available in the environment where a job runs.
 - Supports native sampling, PDD Acc 8-step, and Acc 4-step when the matching
   weight is available; the Acc path uses `MiniMaxH3PDDAccApply`, not a normal
   LoRA loader.
+- Reference presets use base quality with adjustable steps or installed
+  Ref2V Turbo 4/8-step LoRAs with fixed steps. Character swap fixes the Studio
+  preset at eight steps. The UI offers models only from the selected workflow's
+  checkpoint family and relabels media inputs according to their role.
 - Applies H3 sampler, step, sigma-shift, video/audio VAE, frame-count, FPS,
   and output-prefix settings to a copied graph.
 - Optional decode-only latent upscaling through
@@ -178,9 +226,13 @@ already be available in the environment where a job runs.
 - Txt2img tab with prompt and negative prompt, model selectors, dimensions,
   sampler/scheduler, steps, CFG, seed, batch count, filename prefix, and
   live progress.
-- Txt2img extras for img2img, Hires. fix, Anima LLLite, ADetailer, LoRA,
+- Txt2img extras for img2img, inpaint (ImageEditor draw-mask tab, A1111-style
+  grow/blur/invert), Hires. fix, Anima LLLite, ADetailer, LoRA,
   embedding, and hypernetwork insertion.
-- Video/H3 tab with I2V, FLF2V, and R2V-lite mode selection, still/last-frame
+- Qwen Image tab for Qwen Image 2.1 text-to-image and reference-image edits
+  (up to 10 images, first-image latent size, optional KV-cache device/dtype).
+- Video/H3 tab with frame animation, appearance references, references plus
+  start/end guides, character/head swaps, and text generation; still/last-frame
   uploads, reference image/video/audio uploads, H3 recipe selection, model
   stack selectors, auto-size, latent upscale, RTX-VSR, looping, and progress.
 - Batch tab with zone/prompt selectors, slot editor, LoRA filter, preview,
@@ -212,7 +264,8 @@ The installed `comfywrap` command and `python -m comfyui_wrapper` expose:
 | `bindings` | Inspect workflow bindings and supported injection points. |
 | `status` | Show ComfyUI queue/system status. |
 | `interrupt` | Request interruption of the server's current job. |
-| `video` | Queue H3 I2V/FLF2V or R2V-lite video generation. |
+| `video` | Queue H3 frame animation, Ref2VA references/frame guides, swaps, or text generation. |
+| `qwen` | Queue Qwen Image 2.1 text-to-image or a reference-image edit. |
 | `ui` | Launch the optional Gradio WebUI. |
 
 Global CLI options can select a config file and override the ComfyUI host or
@@ -228,8 +281,9 @@ processing toggles.
 - `anima_txt2img.api.json` — Anima UNET + Qwen text encoder + Qwen image VAE.
 - `krea2_txt2img.api.json` — Krea 2 Turbo graph.
 - `flux_gguf_txt2img.api.json` — Flux dev GGUF with dual CLIP inputs.
+- `qwen_image_2_1.api.json` — Qwen Image 2.1 Q6 GGUF text-to-image. Edits add reference images at queue time.
 - `minimax_h3_i2v_loop.api.json` — MiniMax H3 I2V with native audio mux.
-- `minimax_h3_r2v_loop.api.json` — MiniMax H3 FL2VA R2V-lite graph.
+- `minimax_h3_r2v_loop.api.json` — MiniMax H3 Ref2VA reference graph.
 
 Any additional ComfyUI API-format graph can be used by placing it under
 `workflows/`, selecting it in `config.yaml`, and checking `comfywrap bindings`.
@@ -243,6 +297,7 @@ from comfyui_wrapper import (
     ComfyClient,
     generate,
     generate_video,
+    generate_qwen,
     load_config,
     prep_jobs,
     preview_jobs,

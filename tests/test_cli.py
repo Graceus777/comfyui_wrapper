@@ -50,6 +50,30 @@ def test_parser_video_recipe():
     assert args.acc_file.endswith("Acc-8Step.safetensors")
 
 
+def test_parser_reference_with_frame_guides():
+    args = build_parser().parse_args([
+        "video", "--mode", "r2v_frames", "--ref-image", "character.png",
+        "--image", "start.png", "--last-frame", "end.png",
+        "--recipe", "ref_turbo8", "--size-megapixels", "0.8",
+    ])
+    assert args.mode == "r2v_frames"
+    assert args.ref_image == ["character.png"]
+    assert args.image == "start.png"
+    assert args.last_frame == "end.png"
+    assert args.recipe == "ref_turbo8"
+    assert args.size_megapixels == 0.8
+
+
+def test_parser_swap_source_trim():
+    args = build_parser().parse_args([
+        "video", "--mode", "charswap", "--source-start", "1.5", "--source-end", "4.5",
+        "--reference-description", "white feathers",
+    ])
+    assert args.source_start == 1.5
+    assert args.source_end == 4.5
+    assert args.reference_description == "white feathers"
+
+
 def test_parser_video_upscale_flags():
     parser = build_parser()
     args = parser.parse_args([

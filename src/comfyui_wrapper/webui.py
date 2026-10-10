@@ -21,12 +21,23 @@ from comfyui_wrapper.combinator import (
 )
 from comfyui_wrapper.config import WrapperConfig, apply_overrides, load_config
 from comfyui_wrapper.generate import generate
+from comfyui_wrapper.qwen_image import collect_reference_paths, generate_qwen, resolve_qwen_asset
 from comfyui_wrapper.lora import LoRAResolver
 from comfyui_wrapper.h3 import (
+    is_character_swap_mode,
+    h3_frame_count,
+    is_head_swap_mode,
     match_h3_unet,
     recipe_choices,
     resolve_recipe,
     video_recipe_ui,
+    VIDEO_MODES,
+    normalize_video_mode,
+    is_h3_clip,
+    is_h3_video_vae,
+    is_h3_audio_vae,
+    video_workflow_options,
+    video_prompt_default,
 )
 from comfyui_wrapper.models import (
     infer_webui_root,
@@ -42,7 +53,9 @@ from comfyui_wrapper.models import (
     list_vaes,
     share_webui_models,
 )
-from comfyui_wrapper.video import generate_video, h3_size, target_dimensions
+from comfyui_wrapper.video import generate_video, h3_size, target_dimensions, video_frame_size
+from comfyui_wrapper.workflow_containers_ui import build_container_tools
+from comfyui_wrapper.tts_ui import build_voice_clone
 
 CSS = """
 .gradio-container { max-width: 1480px !important; }
@@ -175,6 +188,233 @@ def anima_lllite_controls(
         spec["canny_high"] = high
     return [spec]
 
+
+def resolve_inpaint(
+    enabled: bool,
+    image: str | Path | None,
+    mask: str | Path | None,
+    denoise: float = 0.75,
+    grow: int = 0,
+    blur: int = 4,
+    invert: bool = False,
+) -> dict[str, Any]:
+    """Validate UI-authored A1111-style inpaint settings for ``apply_overrides``."""
+    if not enabled:
+        return {
+            "inpaint_enable": False,
+            "inpaint_image": "",
+            "inpaint_mask": "",
+        }
+    image_value = str(image or "").strip()
+    mask_value = str(mask or "").strip()
+    if not image_value:
+        raise ValueError("Enable inpaint requires an init image (drop one into the Inpaint tab)")
+    if not mask_value:
+        raise ValueError("Enable inpaint requires a mask (paint one, or upload a mask image)")
+    try:
+        denoise_v = float(denoise)
+    except (TypeError, ValueError):
+        raise ValueError("Inpaint denoise must be a number")
+    if not 0.0 < denoise_v <= 1.0:
+        raise ValueError("Inpaint denoise must satisfy 0 < denoise <= 1")
+    try:
+        grow_v = int(float(grow))
+    except (TypeError, ValueError):
+        raise ValueError("Inpaint grow must be a number")
+    try:
+        blur_v = int(float(blur))
+    except (TypeError, ValueError):
+        raise ValueError("Inpaint blur must be a number")
+    if not 0 <= grow_v <= 256:
+        raise ValueError("Inpaint grow must satisfy 0 <= grow <= 256")
+    if not 0 <= blur_v <= 256:
+        raise ValueError("Inpaint blur must satisfy 0 <= blur <= 256")
+    return {
+        "inpaint_enable": True,
+        "inpaint_image": image_value,
+        "inpaint_mask": mask_value,
+        "inpaint_denoise": float(denoise_v),
+        "inpaint_grow": int(grow_v),
+        "inpaint_blur": int(blur_v),
+        "inpaint_invert": bool(invert),
+    }
+
+
+def _load_editor_image(value: Any):
+    """Load a Gradio ImageEditor background/layer value as a PIL image."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        # FileData dicts from the frontend carry {"path": ..., "url": ...}.
+        for key in ("path", "url"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner:
+                value = inner
+                break
+        else:
+            return None
+    if isinstance(value, str):
+        path = Path(value)
+        if not path.is_file():
+            return None
+        from PIL import Image as _PILImage
+
+        return _PILImage.open(path).convert("RGBA")
+    try:
+        import numpy as _np
+        from PIL import Image as _PILImage
+
+        if isinstance(value, _np.ndarray):
+            arr = value
+            if arr.ndim == 2:
+                return _PILImage.fromarray(arr).convert("RGBA")
+            if arr.ndim == 3 and arr.shape[2] in (3, 4):
+                return _PILImage.fromarray(arr.astype("uint8")).convert("RGBA")
+            return None
+        if isinstance(value, _PILImage.Image):
+            return value.convert("RGBA")
+    except Exception:
+        return None
+    return None
+
+
+def editor_layer_to_mask_file(layer: Any, dest_dir: str | Path) -> str | None:
+    """Convert one ImageEditor paint layer to a white-on-black mask PNG.
+
+    Any painted pixel (alpha > threshold, or bright RGB when no alpha) becomes
+    white = repaint, matching A1111's inpaint-masked convention. Returns the
+    saved PNG path, or None when the layer is empty.
+    """
+    img = _load_editor_image(layer)
+    if img is None:
+        return None
+    from PIL import Image as _PILImage
+    import numpy as _np
+
+    rgba = img.convert("RGBA")
+    arr = _np.array(rgba)
+    alpha = arr[:, :, 3].astype("int32")
+    if int(alpha.max()) <= 10:
+        # No alpha strokes: fall back to brightness (e.g. flattened RGB layer).
+        rgb = arr[:, :, :3].astype("int32")
+        bright = rgb.max(axis=2)
+        painted = bright > 10
+        # An all-black layer means "nothing drawn".
+        if not bool(painted.any()):
+            return None
+        # If nearly everything is painted, it is likely an opaque background
+        # layer rather than a mask — treat as empty so a blank canvas does not
+        # repaint the whole picture.
+        if float(painted.mean()) > 0.99:
+            return None
+        mask_arr = (painted.astype("uint8")) * 255
+    else:
+        mask_arr = (((alpha > 10).astype("uint8")) * 255)
+    mask_img = _PILImage.fromarray(mask_arr, mode="L")
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    import tempfile as _tempfile
+
+    fd, tmp = _tempfile.mkstemp(prefix="inpaint-mask-", suffix=".png", dir=str(dest))
+    import os as _os
+
+    _os.close(fd)
+    mask_img.save(tmp, "PNG")
+    return tmp
+
+
+def extract_inpaint_editor(editor: Any, dest_dir: str | Path) -> tuple[str | None, str | None]:
+    """Split an ImageEditor value into (init_path, mask_png_path).
+
+    ``init_path`` is the background upload (no copy). ``mask_png_path`` is a
+    freshly saved white-on-black PNG built from the paint layers, or None when
+    nothing was drawn. Accepts the ``type="filepath"`` dict as well as PIL /
+    numpy values and plain single-image values.
+    """
+    if editor is None:
+        return None, None
+    if isinstance(editor, dict) and not any(k in editor for k in ("background", "layers", "composite")):
+        # Plain FileData dict, not an editor value.
+        img = _load_editor_image(editor)
+        return (str(editor.get("path")) if isinstance(editor.get("path"), str) else None), None
+    if not isinstance(editor, dict):
+        # Single image dropped in (no layers).
+        if isinstance(editor, str) and Path(editor).is_file():
+            return editor, None
+        if _load_editor_image(editor) is not None:
+            import tempfile as _tempfile
+
+            from PIL import Image as _PILImage
+
+            img = _load_editor_image(editor)
+            assert img is not None
+            dest = Path(dest_dir)
+            dest.mkdir(parents=True, exist_ok=True)
+            fd, tmp = _tempfile.mkstemp(prefix="inpaint-init-", suffix=".png", dir=str(dest))
+            import os as _os
+
+            _os.close(fd)
+            img.convert("RGB").save(tmp, "PNG")
+            return tmp, None
+        return None, None
+    background = editor.get("background")
+    layers = editor.get("layers") or []
+    init_path: str | None = None
+    if isinstance(background, str) and Path(background).is_file():
+        init_path = background
+    elif background is not None:
+        loaded = _load_editor_image(background)
+        if loaded is not None:
+            import tempfile as _tempfile
+
+            dest = Path(dest_dir)
+            dest.mkdir(parents=True, exist_ok=True)
+            fd, tmp = _tempfile.mkstemp(prefix="inpaint-init-", suffix=".png", dir=str(dest))
+            import os as _os
+
+            _os.close(fd)
+            loaded.convert("RGB").save(tmp, "PNG")
+            init_path = tmp
+    mask_path: str | None = None
+    try:
+        import numpy as _np
+        from PIL import Image as _PILImage
+    except Exception:
+        return init_path, None
+    combined = None
+    for layer in layers:
+        single = editor_layer_to_mask_file(layer, dest_dir)
+        if single is None:
+            continue
+        from PIL import Image as _PILImage
+
+        part = _PILImage.open(single).convert("L")
+        try:
+            Path(single).unlink()
+        except Exception:
+            pass
+        if combined is None:
+            combined = part
+        else:
+            if combined.size != part.size:
+                part = part.resize(combined.size)
+            import numpy as _np2
+
+            both = _np2.maximum(_np2.array(combined), _np2.array(part))
+            combined = _PILImage.fromarray(both, mode="L")
+    if combined is not None:
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        import tempfile as _tempfile
+
+        fd, tmp = _tempfile.mkstemp(prefix="inpaint-mask-", suffix=".png", dir=str(dest))
+        import os as _os
+
+        _os.close(fd)
+        combined.save(tmp, "PNG")
+        mask_path = tmp
+    return init_path, mask_path
+
 WORKFLOW_PRESETS = {
     "sdxl_txt2img.api.json": {
         "lora_mode": "full",
@@ -215,6 +455,18 @@ WORKFLOW_PRESETS = {
         "vae": "ae.safetensors",
         "lora_mode": "model_only",
         "steps": 20,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "width": 1024,
+        "height": 1024,
+    },
+    "qwen_image_2_1.api.json": {
+        "checkpoint": "qwen_image_2.1-Q6_K.gguf",
+        "clip": "qwen3vl_8b_w4a8.safetensors",
+        "vae": "qwen_image_2.1_vae_bf16.safetensors",
+        "lora_mode": "model_only",
+        "steps": 25,
         "cfg": 1.0,
         "sampler": "euler",
         "scheduler": "simple",
@@ -427,6 +679,7 @@ def format_infotext(
     hires: dict | None = None,
     adetailer: dict | None = None,
     img2img: dict | None = None,
+    inpaint: dict | None = None,
 ) -> str:
     """A1111-style generation info block."""
     lines = [positive or ""]
@@ -457,6 +710,12 @@ def format_infotext(
         bits.append(f"ADetailer: {adetailer.get('model')}")
     if img2img and img2img.get("enable"):
         bits.append(f"img2img: denoise {img2img.get('denoise')}")
+    if inpaint and inpaint.get("enable"):
+        bits.append(
+            f"Inpaint: denoise {inpaint.get('denoise')}, "
+            f"grow {inpaint.get('grow', 0)}, blur {inpaint.get('blur', 0)}"
+            + (", invert" if inpaint.get("invert") else "")
+        )
     lines.append(", ".join(str(x) for x in bits))
     return "\n".join(lines)
 
@@ -628,10 +887,14 @@ def build_ui(cfg: WrapperConfig):
         v_unet = match_h3_unet(checkpoints, rec, vid.unet) or match_choice(
             checkpoints, vid.unet, "minimax_h3_fl2va", "minimax_h3"
         )
-        v_clip = match_choice(clips, vid.clip, "qwen3vl_32b_minimax", "minimax_h3")
-        v_vae = match_choice(vaes, vid.vae, "minimax_h3_video_vae")
-        v_audio_vae = match_choice(vaes, vid.audio_vae, "minimax_h3_audio_vae")
+        v_clip = match_choice([n for n in clips if is_h3_clip(n)], vid.clip, "qwen3vl_32b_minimax") or vid.clip
+        v_vae = match_choice([n for n in vaes if is_h3_video_vae(n)], vid.vae, "minimax_h3_video_vae") or vid.vae
+        v_audio_vae = match_choice([n for n in vaes if is_h3_audio_vae(n)], vid.audio_vae, "minimax_h3_audio_vae") or vid.audio_vae
         rec, v_steps, v_acc = video_recipe_ui(rec, v_unet, acc_files, vid.acc_file)
+        qcfg = cfg_now.qwen
+        q_unet = resolve_qwen_asset(checkpoints, qcfg.unet, "qwen_image_2.1")
+        q_clip = resolve_qwen_asset(clips, qcfg.clip, "qwen3vl_8b")
+        q_vae = resolve_qwen_asset(vaes, qcfg.vae, "qwen_image_2.1_vae")
         anima_specs = [item for item in gen.anima_lllite if isinstance(item, dict)]
         anima_spec = anima_specs[0] if anima_specs else {}
         anima_image_value = str(anima_spec.get("image") or "").strip()
@@ -648,6 +911,9 @@ def build_ui(cfg: WrapperConfig):
                 model_patches[0] if model_patches else None
             )
         ctx["acc_files"] = acc_files
+        ctx["video_unets"] = checkpoints
+        video_options = video_workflow_options(vid.mode, vid, unets=checkpoints, acc_files=acc_files, loras=loras)
+        v_unet, v_steps, v_acc = video_options["model"], video_options["steps"], video_options["acc"]
         init_value = str(getattr(gen, "init_image", "") or "").strip()
         init_path_value: str | None = None
         if init_value:
@@ -664,10 +930,45 @@ def build_ui(cfg: WrapperConfig):
         elif not init_path_value:
             # txt2img default: keep a useful img2img strength ready.
             init_denoise = 0.6 if init_denoise >= 1.0 else init_denoise
+        try:
+            inpaint_denoise = float(getattr(gen, "inpaint_denoise", 0.75) or 0.75)
+        except (TypeError, ValueError):
+            inpaint_denoise = 0.75
+        if not 0.0 < inpaint_denoise <= 1.0:
+            inpaint_denoise = 0.75
+        try:
+            inpaint_grow = int(float(getattr(gen, "inpaint_grow", 0) or 0))
+        except (TypeError, ValueError):
+            inpaint_grow = 0
+        try:
+            inpaint_blur = int(float(getattr(gen, "inpaint_blur", 4) or 0))
+        except (TypeError, ValueError):
+            inpaint_blur = 4
+        inpaint_image_value = str(getattr(gen, "inpaint_image", "") or "").strip()
+        inpaint_image_path: str | None = None
+        if inpaint_image_value:
+            inpaint_candidate = Path(inpaint_image_value)
+            if not inpaint_candidate.is_absolute():
+                inpaint_candidate = cfg_now.paths.root / inpaint_candidate
+            inpaint_image_path = str(inpaint_candidate) if inpaint_candidate.is_file() else None
+        inpaint_mask_value = str(getattr(gen, "inpaint_mask", "") or "").strip()
+        inpaint_mask_path: str | None = None
+        if inpaint_mask_value:
+            mask_candidate = Path(inpaint_mask_value)
+            if not mask_candidate.is_absolute():
+                mask_candidate = cfg_now.paths.root / mask_candidate
+            inpaint_mask_path = str(mask_candidate) if mask_candidate.is_file() else None
         return {
             "status": status,
             "img2img_image": init_path_value,
             "img2img_denoise": float(init_denoise),
+            "inpaint_enable": bool(getattr(gen, "inpaint_enable", False)),
+            "inpaint_image": inpaint_image_path,
+            "inpaint_mask": inpaint_mask_path,
+            "inpaint_denoise": float(inpaint_denoise),
+            "inpaint_grow": int(inpaint_grow),
+            "inpaint_blur": int(inpaint_blur),
+            "inpaint_invert": bool(getattr(gen, "inpaint_invert", False)),
             "checkpoints": checkpoints,
             "checkpoint": gen.checkpoint if gen.checkpoint in checkpoints or gen.checkpoint else (checkpoints[0] if checkpoints else None),
             "clips": clips,
@@ -712,21 +1013,31 @@ def build_ui(cfg: WrapperConfig):
             "prompt_config": prompts[0] if prompts else None,
             "jobs": jobs,
             "job_file": jobs[0] if jobs else None,
-            "v_unets": prefer_first(checkpoints, v_unet),
+            "v_unets": video_options["models"],
             "v_unet": v_unet,
-            "v_clips": prefer_first(clips, v_clip),
+            "v_clips": prefer_first([n for n in clips if is_h3_clip(n)], v_clip),
             "v_clip": v_clip,
-            "v_vaes": prefer_first(vaes, v_vae),
+            "v_vaes": prefer_first([n for n in vaes if is_h3_video_vae(n)], v_vae),
             "v_vae": v_vae,
-            "v_audio_vaes": prefer_first(vaes, v_audio_vae),
+            "v_audio_vaes": prefer_first([n for n in vaes if is_h3_audio_vae(n)], v_audio_vae),
             "v_audio_vae": v_audio_vae,
-            "v_recipes": recipe_choices(acc_files),
-            "v_recipe": rec.key,
+            "v_recipes": video_options["recipes"],
+            "v_recipe": video_options["recipe"],
+            "v_options": video_options,
             "v_acc_files": prefer_first(acc_files, v_acc) if rec.acc else ([""] + prefer_first(acc_files, None)),
             "v_acc": v_acc,
             "v_steps": v_steps,
             "v_latent_upscale": bool(vid.latent_upscale),
             "v_rtx_vsr": bool(vid.rtx_vsr),
+            "v_save_latents": bool(vid.save_latents),
+            "q_unets": prefer_first(checkpoints, q_unet),
+            "q_unet": q_unet,
+            "q_clips": prefer_first(clips, q_clip),
+            "q_clip": q_clip,
+            "q_vaes": prefer_first(vaes, q_vae),
+            "q_vae": q_vae,
+            "q_sampler": qcfg.sampler or "euler",
+            "q_scheduler": qcfg.scheduler or "simple",
         }
 
     initial = load_options()
@@ -735,7 +1046,7 @@ def build_ui(cfg: WrapperConfig):
         gr.Markdown("## ComfyUI Wrapper")
         status_md = gr.Markdown(initial["status"], elem_id="top-status")
 
-        with gr.Row():
+        with gr.Row() as model_row:
             workflow = gr.Dropdown(
                 label="Workflow",
                 choices=initial["workflows"],
@@ -751,7 +1062,7 @@ def build_ui(cfg: WrapperConfig):
                 allow_custom_value=True,
             )
             refresh_btn = gr.Button("Refresh", elem_id="refresh-btn", scale=1)
-        with gr.Row():
+        with gr.Row() as encoder_row:
             clip = gr.Dropdown(
                 label="Text encoder / CLIP",
                 choices=initial["clips"],
@@ -775,7 +1086,7 @@ def build_ui(cfg: WrapperConfig):
             )
 
         with gr.Tabs():
-            with gr.Tab("txt2img"):
+            with gr.Tab("txt2img") as image_tab:
                 with gr.Row():
                     with gr.Column(scale=6):
                         with gr.Row(elem_id="prompt-row", equal_height=True):
@@ -959,24 +1270,80 @@ def build_ui(cfg: WrapperConfig):
                                 )
 
                         with gr.Accordion("img2img", open=False):
-                            gr.Markdown(
-                                "Drop an init image to rework it instead of txt2img. "
-                                "It is resized to Width × Height (lanczos), VAE-encoded, "
-                                "and fed to the first KSampler. Works on SDXL, Anima, "
-                                "Krea 2, and Flux GGUF. Empty = txt2img."
-                            )
-                            img2img_image = gr.Image(
-                                label="Init image (empty = txt2img)",
-                                type="filepath",
-                                value=initial.get("img2img_image"),
-                            )
-                            img2img_denoise = gr.Slider(
-                                label="Denoise (0.3 light to 0.75 heavy rework)",
-                                minimum=0.0,
-                                maximum=1.0,
-                                step=0.01,
-                                value=float(initial.get("img2img_denoise", 0.6)),
-                            )
+                            with gr.Tabs():
+                                with gr.Tab("img2img"):
+                                    gr.Markdown(
+                                        "Drop an init image to rework it instead of txt2img. "
+                                        "It is resized to Width × Height (lanczos), VAE-encoded, "
+                                        "and fed to the first KSampler. Works on SDXL, Anima, "
+                                        "Krea 2, and Flux GGUF. Empty = txt2img."
+                                    )
+                                    img2img_image = gr.Image(
+                                        label="Init image (empty = txt2img)",
+                                        type="filepath",
+                                        value=initial.get("img2img_image"),
+                                    )
+                                    img2img_denoise = gr.Slider(
+                                        label="Denoise (0.3 light to 0.75 heavy rework)",
+                                        minimum=0.0,
+                                        maximum=1.0,
+                                        step=0.01,
+                                        value=float(initial.get("img2img_denoise", 0.6)),
+                                    )
+                                with gr.Tab("Inpaint"):
+                                    gr.Markdown(
+                                        "A1111-style inpaint: drop the init image, then paint the "
+                                        "mask with the brush (white = repaint, black = keep). "
+                                        "Uses whole-picture `SetLatentNoiseMask`, so it works on "
+                                        "SDXL, Anima, Krea 2, and Flux GGUF without an inpaint model. "
+                                        "Tip: use a large brush for areas, eraser to fix mistakes. "
+                                        "Or upload a white-on-black mask below to override the drawing."
+                                    )
+                                    inpaint_enable = gr.Checkbox(
+                                        label="Enable inpaint (overrides img2img when a mask exists)",
+                                        value=bool(initial.get("inpaint_enable", False)),
+                                    )
+                                    inpaint_editor = gr.ImageEditor(
+                                        label="Inpaint: init image + paint mask (white = repaint)",
+                                        type="filepath",
+                                        image_mode="RGBA",
+                                        brush=gr.Brush(
+                                            colors=["#ffffff"],
+                                            default_color="#ffffff",
+                                        ),
+                                        value=initial.get("inpaint_image"),
+                                    )
+                                    inpaint_mask_upload = gr.Image(
+                                        label="Mask upload (optional, white = repaint; overrides drawing)",
+                                        type="filepath",
+                                        value=initial.get("inpaint_mask"),
+                                    )
+                                    inpaint_denoise = gr.Slider(
+                                        label="Inpaint denoise (0.5 gentle to 1.0 full repaint)",
+                                        minimum=0.0,
+                                        maximum=1.0,
+                                        step=0.01,
+                                        value=float(initial.get("inpaint_denoise", 0.75)),
+                                    )
+                                    with gr.Row():
+                                        inpaint_grow = gr.Slider(
+                                            label="Mask expand (grow, px)",
+                                            minimum=0,
+                                            maximum=64,
+                                            step=1,
+                                            value=int(initial.get("inpaint_grow", 0)),
+                                        )
+                                        inpaint_blur = gr.Slider(
+                                            label="Mask blur / feather (px)",
+                                            minimum=0,
+                                            maximum=64,
+                                            step=1,
+                                            value=int(initial.get("inpaint_blur", 4)),
+                                        )
+                                        inpaint_invert = gr.Checkbox(
+                                            label="Invert mask (inpaint not masked)",
+                                            value=bool(initial.get("inpaint_invert", False)),
+                                        )
 
                         with gr.Accordion("Hires. fix", open=False):
                             hires_enable = gr.Checkbox(
@@ -1133,91 +1500,270 @@ def build_ui(cfg: WrapperConfig):
                             elem_id="infotext",
                         )
 
-            with gr.Tab("Video / H3 loop"):
+            with gr.Tab("Qwen Image") as qwen_tab:
                 gr.Markdown(
-                    "MiniMax H3 image-to-video with native audio mux "
-                    "(audio VAE + VAEDecodeAudio → CreateVideo), plus optional "
-                    "cyclic crossfade. Native is 12-step `res_multistep` (Acc file cleared). "
-                    "Acc uses `MiniMaxH3PDDAccApply` (not Load LoRA) with euler + Acc sigmas. "
-                    "**Size from image** keeps the still's aspect on H3's 32px grid "
-                    "(1024×1280 → 640×800) and writes that size to both `ImageScale` and "
-                    "the H3 latent. 3D latent upscaler is decode-only 2x; RTX VSR is a post pass. "
-                    "**R2V-lite** reuses your FL2VA UNET with the native `MiniMaxH3ReferenceToVideo` node "
-                    "(`<Picture i>` / `<Video k>` / `<Audio j>`); weaker refs than true Ref2VA, zero new models. "
-                    "I2V accepts an optional last frame for first+last-frame interpolation."
+                    "Qwen Image 2.1 on the Q6 graph: `qwen_image_2.1-Q6_K.gguf`, "
+                    "`qwen3vl_8b_w4a8.safetensors`, `qwen_image_2.1_vae_bf16.safetensors`. "
+                    "On a 12 GB GPU, start ComfyUI with `run_qwen_image_2_1_q6_lowvram.bat`. "
+                    "Text to image samples an empty latent at Width × Height "
+                    "(Euler, simple, CFG 1, 25 steps). "
+                    "Image edit feeds up to 10 references into `TextEncodeQwenImage21`. "
+                    "**Match first image** samples at that image's size; another "
+                    "Width × Height shifts the edit. Reference size is the encoder "
+                    "resize (0 keeps each image, snapped to 32). "
+                    "Cache **cpu** / **int8** is the low-VRAM edit setting."
+                )
+                with gr.Row():
+                    with gr.Column(scale=6):
+                        q_mode = gr.Dropdown(
+                            label="Qwen mode",
+                            choices=[("Text to image", "txt2img"), ("Image edit", "edit")],
+                            value="txt2img",
+                        )
+                        q_prompt = gr.Textbox(
+                            label="Prompt",
+                            lines=4,
+                            value=cfg.qwen.prompt or "",
+                            placeholder="a ceramic teapot on a wooden table, soft window light",
+                        )
+                        q_negative = gr.Textbox(
+                            label="Negative prompt",
+                            lines=2,
+                            value=cfg.qwen.negative or "",
+                        )
+                        q_image = gr.Image(
+                            label="Reference image",
+                            type="filepath",
+                            visible=False,
+                        )
+                        q_extra_images = gr.File(
+                            label="More reference images",
+                            file_count="multiple",
+                            file_types=["image"],
+                            visible=False,
+                        )
+                        q_match = gr.Checkbox(
+                            label="Match first image",
+                            value=bool(cfg.qwen.match_reference),
+                            visible=False,
+                        )
+                        with gr.Row():
+                            q_width = gr.Slider(
+                                label="Width",
+                                minimum=256,
+                                maximum=2048,
+                                step=16,
+                                value=int(cfg.qwen.width),
+                            )
+                            q_height = gr.Slider(
+                                label="Height",
+                                minimum=256,
+                                maximum=2048,
+                                step=16,
+                                value=int(cfg.qwen.height),
+                            )
+                            q_resolution = gr.Slider(
+                                label="Reference size",
+                                minimum=0,
+                                maximum=2048,
+                                step=32,
+                                value=int(cfg.qwen.resolution),
+                                visible=False,
+                            )
+                        with gr.Row():
+                            q_steps = gr.Slider(
+                                label="Steps",
+                                minimum=1,
+                                maximum=80,
+                                step=1,
+                                value=int(cfg.qwen.steps),
+                            )
+                            q_cfg = gr.Slider(
+                                label="CFG",
+                                minimum=1,
+                                maximum=8,
+                                step=0.5,
+                                value=float(cfg.qwen.cfg),
+                            )
+                            q_sampler = gr.Dropdown(
+                                label="Sampler",
+                                choices=initial["samplers"],
+                                value=initial["q_sampler"],
+                            )
+                            q_scheduler = gr.Dropdown(
+                                label="Scheduler",
+                                choices=initial["schedulers"],
+                                value=initial["q_scheduler"],
+                            )
+                        with gr.Row():
+                            q_seed = gr.Number(label="Seed (-1 = random)", value=int(cfg.qwen.seed), precision=0)
+                            q_batch_count = gr.Slider(
+                                label="Batch count",
+                                minimum=1,
+                                maximum=8,
+                                step=1,
+                                value=1,
+                            )
+                            q_batch_size = gr.Slider(
+                                label="Batch size",
+                                minimum=1,
+                                maximum=4,
+                                step=1,
+                                value=int(cfg.qwen.batch_size),
+                            )
+                        with gr.Row():
+                            q_unet = gr.Dropdown(
+                                label="Qwen UNET",
+                                choices=initial["q_unets"],
+                                value=initial["q_unet"],
+                                allow_custom_value=True,
+                                scale=2,
+                            )
+                            q_clip = gr.Dropdown(
+                                label="Qwen CLIP",
+                                choices=initial["q_clips"],
+                                value=initial["q_clip"],
+                                allow_custom_value=True,
+                                scale=2,
+                            )
+                            q_vae = gr.Dropdown(
+                                label="Qwen VAE",
+                                choices=initial["q_vaes"],
+                                value=initial["q_vae"],
+                                allow_custom_value=True,
+                                scale=2,
+                            )
+                        with gr.Row():
+                            q_cache_device = gr.Dropdown(
+                                label="Cache device",
+                                choices=["auto", "gpu", "cpu", "off"],
+                                value=str(cfg.qwen.cache_device or "auto"),
+                            )
+                            q_cache_dtype = gr.Dropdown(
+                                label="Cache dtype",
+                                choices=["default", "int8", "int4"],
+                                value=str(cfg.qwen.cache_dtype or "default"),
+                            )
+                        with gr.Row():
+                            q_generate = gr.Button("Generate Qwen", variant="primary")
+                            q_interrupt = gr.Button("Interrupt")
+                    with gr.Column(scale=5):
+                        q_gallery = gr.Gallery(
+                            label="Output",
+                            columns=2,
+                            height=560,
+                            object_fit="contain",
+                            preview=True,
+                        )
+                        q_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+                        q_info = gr.Textbox(label="Generation info", lines=6)
+
+            with gr.Tab("Video") as video_tab:
+                gr.Markdown(
+                    "Choose what the pictures should do: anchor a scene, supply an appearance, "
+                    "or replace someone in a video. The workflow selects compatible models and sampling settings."
                 )
                 with gr.Row():
                     with gr.Column(scale=5):
                         with gr.Row():
                             v_mode = gr.Dropdown(
-                                label="Mode",
-                                choices=[("Image-to-video", "i2v"), ("Reference-lite (FL2VA)", "r2v")],
-                                value="i2v",
+                                label="Workflow",
+                                choices=VIDEO_MODES,
+                                value=normalize_video_mode(cfg.video.mode),
                             )
                             v_ref_size = gr.Dropdown(
-                                label="Ref size",
-                                choices=["match", "max"],
+                                label="Appearance reference detail",
+                                choices=[("Standard", "match"), ("More detail (slower)", "max")],
                                 value=str(getattr(cfg.video, "ref_image_size", "match") or "match"),
+                                visible=False,
                             )
-                        v_image = gr.Image(label="First frame (I2V; doubles as <Picture 1> in R2V)", type="filepath")
-                        v_last = gr.Image(label="Last frame (optional FLF2V, I2V only)", type="filepath")
-                        v_ref_images = gr.File(label="Ref stills (<Picture i>, max 9)", file_count="multiple", file_types=["image"])
-                        v_ref_video = gr.File(label="Ref clip (<Video k>, mp4, max 3)", file_count="multiple", file_types=["video"])
-                        v_ref_audio = gr.File(label="Ref audio (<Audio j>, max 3)", file_count="multiple", file_types=["audio"])
+                        v_workflow_hint = gr.Markdown(initial["v_options"]["hint"])
+                        v_image = gr.Image(label="Start frame", type="filepath")
+                        v_last = gr.Image(label="End frame (optional)", type="filepath")
+                        v_ref_images = gr.File(label="Additional appearance references", file_count="multiple", file_types=["image"], visible=False)
+                        v_ref_video = gr.File(label="Source video", file_count="multiple", file_types=["video"], visible=False)
+                        v_ref_video_audio = gr.Checkbox(label="Use sound from reference videos", value=cfg.video.ref_video_audio, visible=False)
+                        v_source_preview = gr.Video(label="Source clip preview", interactive=False, visible=False)
+                        with gr.Group(visible=False) as v_swap_trim:
+                            with gr.Row():
+                                v_source_start = gr.Number(label="Source start (seconds)", value=cfg.video.swap_source_start, minimum=0)
+                                v_source_end = gr.Number(label="Source end (seconds; 0 = whole clip)", value=cfg.video.swap_source_end, minimum=0)
+                        v_swap_hint = gr.Markdown(
+                            "The replacement picture supplies appearance. The selected source segment supplies "
+                            "movement and scene; its duration and audio are retained.", visible=False,
+                        )
+                        v_reference_description = gr.Textbox(label="Replacement character appearance (optional)", lines=3, visible=False)
+                        v_sam_target = gr.Textbox(
+                            label="SAM3 target (character swap: who to replace)",
+                            lines=1,
+                            value=str(getattr(cfg.video, "sam3_target", "") or ""),
+                            placeholder="the person",
+                            visible=False,
+                        )
+                        v_sam3 = gr.State(str(cfg.video.sam3_checkpoint))
+                        v_ref_audio = gr.File(label="Audio references (optional, max 3)", file_count="multiple", file_types=["audio"], visible=False)
                         v_prompt = gr.Textbox(
                             label="Motion prompt",
                             lines=6,
-                            value=cfg.video.prompt or "",
+                            value=video_prompt_default(cfg.video, cfg.video.mode),
                         )
                         with gr.Row():
                             v_width = gr.Number(label="Width", value=int(cfg.video.width), precision=0)
                             v_height = gr.Number(label="Height", value=int(cfg.video.height), precision=0)
                             v_auto_size = gr.Checkbox(
-                                label="Size from image (H3 32px grid)",
+                                label="Match the frame's aspect ratio",
                                 value=True,
                             )
                         with gr.Row():
                             v_recipe = gr.Dropdown(
-                                label="Recipe",
+                                label="Sampling preset",
                                 choices=initial["v_recipes"],
                                 value=initial["v_recipe"],
                             )
-                            v_frames = gr.Slider(label="Frames (24 fps)", minimum=29, maximum=362, step=17, value=int(cfg.video.frames))
-                            v_steps = gr.Slider(label="Steps", minimum=4, maximum=40, step=1, value=int(initial["v_steps"]))
+                            v_frames = gr.Slider(label="Duration (seconds; rounded to a supported length)", minimum=0.2, maximum=15, step=0.1, value=min(15, cfg.video.frames / 24))
+                            v_steps = gr.Slider(label="Quality steps", minimum=4, maximum=50, step=1, value=int(initial["v_steps"]), visible=initial["v_options"]["steps_visible"])
                             v_seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
-                        with gr.Row():
+                        v_megapixels = gr.Slider(label="Resolution (megapixels)", minimum=0.2, maximum=0.98, step=0.02, value=cfg.video.size_megapixels)
+                        with gr.Accordion("Model files", open=False):
                             v_unet = gr.Dropdown(
-                                label="H3 UNET",
+                                label="Compatible video model",
                                 choices=initial["v_unets"],
                                 value=initial["v_unet"],
-                                allow_custom_value=True,
+                                allow_custom_value=False,
                             )
                             v_clip = gr.Dropdown(
-                                label="H3 CLIP",
+                                label="H3 text / vision encoder",
                                 choices=initial["v_clips"],
                                 value=initial["v_clip"],
-                                allow_custom_value=True,
+                                allow_custom_value=False,
+                                visible=len(initial["v_clips"]) > 1,
                             )
                             v_vae = gr.Dropdown(
                                 label="Video VAE",
                                 choices=initial["v_vaes"],
                                 value=initial["v_vae"],
-                                allow_custom_value=True,
+                                allow_custom_value=False,
                             )
                             v_audio_vae = gr.Dropdown(
                                 label="Audio VAE",
                                 choices=initial["v_audio_vaes"],
                                 value=initial["v_audio_vae"],
-                                allow_custom_value=True,
+                                allow_custom_value=False,
+                                visible=len(initial["v_audio_vaes"]) > 1,
                             )
                         v_acc = gr.Dropdown(
                             label="Acc file (PDD, not LoRA)",
                             choices=initial["v_acc_files"],
                             value=initial["v_acc"],
                             allow_custom_value=True,
+                            visible=False,
                         )
                         with gr.Row():
-                            v_loop = gr.Checkbox(label="Close loop (ffmpeg crossfade)", value=bool(cfg.video.loop))
+                            v_loop = gr.Checkbox(label="Blend the ending into the opening for a loop", value=False)
+                            v_save_latents = gr.Checkbox(
+                                label="Save AV latents (.latent)",
+                                value=bool(initial["v_save_latents"]),
+                            )
                             v_latent_up = gr.Checkbox(
                                 label="3D latent upscaler (2x)",
                                 value=bool(initial["v_latent_upscale"]),
@@ -1226,12 +1772,48 @@ def build_ui(cfg: WrapperConfig):
                                 label="RTX VSR (2x post)",
                                 value=bool(initial["v_rtx_vsr"]),
                             )
-                        v_generate = gr.Button("Generate loop", variant="primary", elem_id="generate-btn")
+                        v_crossfade = gr.Slider(label="Loop blend (frames)", minimum=1, maximum=24, step=1, value=cfg.video.crossfade_frames, visible=False)
+                        v_generate = gr.Button("Generate video", variant="primary", elem_id="generate-btn")
                     with gr.Column(scale=5):
                         v_video = gr.Video(label="Output")
                         v_status = gr.Textbox(label="Status", value="Ready", interactive=False)
 
-            with gr.Tab("Batch"):
+            with gr.Tab("Upscale from latents") as upscale_tab:
+                gr.Markdown(
+                    "Decode-only 2x without re-sampling. Drop **both** saved halves "
+                    "`*_video.latent` + `*_audio.latent` (needs Save AV latents on "
+                    "the Video tab) for the 3D latent upscaler with audio, or drop "
+                    "a rendered `.mp4` for RTX VSR. Dropping only the video half "
+                    "upscales silent — the browser upload has no sibling next to it. "
+                    "**Auto from file** picks the path from the suffix, so the "
+                    "single radio below is the only setting — VAE / model / scale / "
+                    "quality come from your Video config."
+                )
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        up_file = gr.File(
+                            label="Drop *_video.latent + *_audio.latent (3D 2x) or rendered clip .mp4/.webm/.mov/.mkv (RTX VSR)",
+                            file_count="multiple",
+                            file_types=[".latent", ".safetensors", ".mp4", ".webm", ".mov", ".mkv"],
+                        )
+                        up_mode = gr.Radio(
+                            label="Upscaler (single check)",
+                            choices=[
+                                ("Auto from file", "auto"),
+                                ("3D latent 2x (decode-only)", "latent"),
+                                ("RTX VSR 2x (rendered clip)", "rtx"),
+                            ],
+                            value="auto",
+                        )
+                        up_run = gr.Button("Upscale", variant="primary")
+                    with gr.Column(scale=5):
+                        up_video = gr.Video(label="Upscaled output")
+                        up_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+
+            tools_tab = build_container_tools(gr, ctx)
+            voice_clone_tab = build_voice_clone(gr, ctx)
+
+            with gr.Tab("Batch") as batch_tab:
                 gr.Markdown(
                     "Combinator batch: expand a zone (Always / Loop / Random) plus "
                     "prompt slots, inspect the job list, then run it."
@@ -1383,7 +1965,7 @@ def build_ui(cfg: WrapperConfig):
                             elem_id="batch-log",
                         )
 
-            with gr.Tab("History"):
+            with gr.Tab("History") as history_tab:
                 gr.Markdown(f"Recent images in `{cfg.paths.output}`")
                 history_refresh = gr.Button("Refresh history")
                 history_gallery = gr.Gallery(
@@ -1393,6 +1975,22 @@ def build_ui(cfg: WrapperConfig):
                     object_fit="contain",
                     value=gallery_items(list_output_images(cfg)),
                 )
+
+        # These selectors belong to the configurable tabs. Dedicated tools own
+        # fixed recipes, so hide the unrelated selectors while a tool is open.
+        tools_tab.select(
+            lambda: (gr.update(visible=False), gr.update(visible=False)),
+            inputs=[], outputs=[model_row, encoder_row], queue=False,
+        )
+        voice_clone_tab.select(
+            lambda: (gr.update(visible=False), gr.update(visible=False)),
+            inputs=[], outputs=[model_row, encoder_row], queue=False,
+        )
+        for configurable_tab in (image_tab, qwen_tab, video_tab, upscale_tab, batch_tab, history_tab):
+            configurable_tab.select(
+                lambda: (gr.update(visible=True), gr.update(visible=True)),
+                inputs=[], outputs=[model_row, encoder_row], queue=False,
+            )
 
         last_seed = gr.State(int(cfg.generation.seed))
 
@@ -1439,16 +2037,23 @@ def build_ui(cfg: WrapperConfig):
                 opt["v_steps"],
                 opt["v_latent_upscale"],
                 opt["v_rtx_vsr"],
+                opt["v_save_latents"],
+                gr.update(choices=opt["q_unets"], value=opt["q_unet"]),
+                gr.update(choices=opt["q_clips"], value=opt["q_clip"]),
+                gr.update(choices=opt["q_vaes"], value=opt["q_vae"]),
+                gr.update(choices=opt["samplers"], value=opt["q_sampler"]),
+                gr.update(choices=opt["schedulers"], value=opt["q_scheduler"]),
             )
 
-        refresh_btn.click(
+        refresh_event = refresh_btn.click(
             refresh_all,
             outputs=[
                 status_md, checkpoint, workflow, clip, clip2, vae, lora_pick, emb_pick, hn_pick,
                 sampler, scheduler, hires_upscaler, ad_model, anima_model_patch,
                 zone, prompt_config, job_file,
                 b_sampler, b_scheduler, b_ad_model, v_unet, v_clip, v_vae, v_audio_vae,
-                v_recipe, v_acc, v_steps, v_latent_up, v_rtx,
+                v_recipe, v_acc, v_steps, v_latent_up, v_rtx, v_save_latents,
+                q_unet, q_clip, q_vae, q_sampler, q_scheduler,
             ],
         )
 
@@ -1493,13 +2098,143 @@ def build_ui(cfg: WrapperConfig):
             return "Interrupt sent"
 
         interrupt_btn.click(interrupt, outputs=[gen_status])
+        q_interrupt.click(interrupt, outputs=[q_status])
         stop_batch_btn.click(interrupt, outputs=[batch_log])
+
+        def on_qwen_mode(mode_s):
+            edit = str(mode_s or "") == "edit"
+            shown = gr.update(visible=edit)
+            return shown, shown, shown, shown
+
+        q_mode.change(
+            on_qwen_mode,
+            inputs=[q_mode],
+            outputs=[q_image, q_extra_images, q_match, q_resolution],
+        )
+
+        def run_qwen(
+            mode_s, prompt_s, negative_s, image_path, extra_files, match_on,
+            width_v, height_v, resolution_v, steps_v, cfg_v, sampler_s, scheduler_s,
+            seed_v, batch_count_v, batch_size_v, unet_s, clip_s, vae_s,
+            cache_device_s, cache_dtype_s,
+        ):
+            if not ctx["busy"].acquire(blocking=False):
+                yield gallery_items([]), "Already running — wait or Interrupt.", ""
+                return
+            ctx["stop"].clear()
+            result_q: queue.Queue = queue.Queue()
+
+            def worker():
+                images: list[str] = []
+                info = ""
+                try:
+                    client = live_client()
+                    if not client.ping():
+                        raise ComfyError(f"ComfyUI is not reachable at {ctx['cfg'].comfyui.base_url}")
+                    mode_n = "edit" if str(mode_s or "") == "edit" else "txt2img"
+                    refs = collect_reference_paths(image_path, extra_files) if mode_n == "edit" else []
+                    count = max(1, int(batch_count_v or 1))
+                    seed_i = int(seed_v) if seed_v is not None else -1
+                    for i in range(count):
+                        if ctx["stop"].is_set():
+                            result_q.put(("status", "Stopped"))
+                            break
+                        this_seed = -1 if seed_i < 0 else seed_i + i
+
+                        def on_progress(msg, _i=i):
+                            result_q.put(("status", format_progress(msg)))
+
+                        result_q.put(("status", f"Queueing Qwen {mode_n} {i + 1}/{count}..."))
+                        result = generate_qwen(
+                            prompt_s,
+                            negative=negative_s,
+                            images=refs,
+                            mode=mode_n,
+                            seed=this_seed,
+                            steps=int(steps_v),
+                            cfg_scale=float(cfg_v),
+                            width=int(width_v),
+                            height=int(height_v),
+                            sampler=sampler_s or None,
+                            scheduler=scheduler_s or None,
+                            batch_size=int(batch_size_v),
+                            unet=unet_s or None,
+                            clip=clip_s or None,
+                            vae=vae_s or None,
+                            resolution=int(resolution_v),
+                            match_reference=bool(match_on),
+                            cache_device=cache_device_s or None,
+                            cache_dtype=cache_dtype_s or None,
+                            cfg=ctx["cfg"],
+                            client=client,
+                            on_progress=on_progress,
+                        )
+                        images.extend(collect_saved(result, client, ctx["cfg"].paths.output))
+                        info = format_infotext(
+                            positive=result.positive,
+                            negative=result.negative,
+                            steps=int(steps_v),
+                            sampler=str(sampler_s or "euler"),
+                            scheduler=str(scheduler_s or "simple"),
+                            cfg=float(cfg_v),
+                            seed=result.seed,
+                            width=int(width_v),
+                            height=int(height_v),
+                            checkpoint=str(unet_s or ""),
+                        )
+                        if mode_n == "edit":
+                            info += (
+                                f"\nEdit: {len(refs)} reference(s), "
+                                f"resolution {int(resolution_v)}, "
+                                f"match first image {bool(match_on)}"
+                            )
+                        info += f"\nCache: {cache_device_s}/{cache_dtype_s}"
+                        if count > 1:
+                            info += f"\nBatch {i + 1}/{count}"
+                        result_q.put(("partial", (list(images), info)))
+                    result_q.put(("done", (list(images), info)))
+                except Exception as exc:
+                    result_q.put(("error", str(exc)))
+                finally:
+                    ctx["busy"].release()
+
+            threading.Thread(target=worker, daemon=True).start()
+            out_images: list[str] = []
+            out_info = ""
+            yield gallery_items(out_images), "Starting...", out_info
+            while True:
+                kind, payload = result_q.get()
+                if kind == "status":
+                    yield gallery_items(out_images), payload, out_info
+                elif kind == "partial":
+                    out_images, out_info = payload
+                    yield gallery_items(out_images), f"Generated {len(out_images)} image(s)", out_info
+                elif kind == "error":
+                    yield gallery_items(out_images), f"Error: {payload}", payload
+                    break
+                elif kind == "done":
+                    out_images, out_info = payload
+                    yield gallery_items(out_images), "Done", out_info
+                    break
+
+        q_generate.click(
+            run_qwen,
+            inputs=[
+                q_mode, q_prompt, q_negative, q_image, q_extra_images, q_match,
+                q_width, q_height, q_resolution, q_steps, q_cfg, q_sampler, q_scheduler,
+                q_seed, q_batch_count, q_batch_size, q_unet, q_clip, q_vae,
+                q_cache_device, q_cache_dtype,
+            ],
+            outputs=[q_gallery, q_status, q_info],
+        )
 
         def run_txt2img(
             prompt_s, negative_s, checkpoint_s, clip_s, clip2_s, vae_s, workflow_s, sampler_s, scheduler_s,
             steps_v, width_v, height_v, cfg_v, batch_count_v, batch_size_v,
             seed_v, denoise_v, prefix_s,
             img2img_img, img2img_dn,
+            inpaint_on, inpaint_editor_val, inpaint_mask_upload_val,
+            inpaint_dn, inpaint_grow_v, inpaint_blur_v, inpaint_invert_v,
             hires_on, hires_up, hires_sc, hires_st, hires_dn,
             anima_on, anima_img, anima_pre, anima_c_low, anima_c_high,
             anima_patch, anima_weight, anima_start_v, anima_end_v,
@@ -1534,14 +2269,50 @@ def build_ui(cfg: WrapperConfig):
                         float(anima_c_low),
                         float(anima_c_high),
                     )
+                    # A1111-style inpaint: editor background = init, brush layers = mask.
+                    mask_dir = ctx["cfg"].paths.output / "masks"
+                    editor_init, drawn_mask = extract_inpaint_editor(
+                        inpaint_editor_val, mask_dir
+                    )
+                    uploaded_mask = str(inpaint_mask_upload_val or "").strip()
+                    inpaint_spec: dict[str, Any] = {
+                        "inpaint_enable": False,
+                        "inpaint_image": "",
+                        "inpaint_mask": "",
+                    }
+                    use_inpaint = False
+                    inpaint_init_path = ""
+                    inpaint_mask_path = ""
+                    if bool(inpaint_on):
+                        fallback_init = editor_init or str(img2img_img or "").strip()
+                        candidate_mask = uploaded_mask or drawn_mask or ""
+                        inpaint_spec = resolve_inpaint(
+                            True,
+                            fallback_init,
+                            candidate_mask,
+                            inpaint_dn,
+                            inpaint_grow_v,
+                            inpaint_blur_v,
+                            bool(inpaint_invert_v),
+                        )
+                        use_inpaint = True
+                        inpaint_init_path = str(inpaint_spec.get("inpaint_image") or "")
+                        inpaint_mask_path = str(inpaint_spec.get("inpaint_mask") or "")
                     init_path = str(img2img_img or "").strip()
-                    use_img2img = bool(init_path)
+                    if use_inpaint and not init_path:
+                        init_path = inpaint_init_path
+                    use_img2img = bool(init_path) or use_inpaint
                     try:
-                        eff_denoise = float(img2img_dn) if use_img2img else float(denoise_v)
+                        if use_inpaint:
+                            eff_denoise = float(inpaint_spec.get("inpaint_denoise"))
+                        elif init_path:
+                            eff_denoise = float(img2img_dn)
+                        else:
+                            eff_denoise = float(denoise_v)
                     except (TypeError, ValueError):
                         raise ValueError("Denoise must be a number")
                     if use_img2img and not 0.0 < eff_denoise <= 1.0:
-                        raise ValueError("img2img Denoise must satisfy 0 < denoise <= 1")
+                        raise ValueError("Denoise must satisfy 0 < denoise <= 1")
                     for i in range(count):
                         if ctx["stop"].is_set():
                             result_q.put(("status", "Stopped"))
@@ -1566,6 +2337,21 @@ def build_ui(cfg: WrapperConfig):
                             filename_prefix=prefix_s or None,
                             seed=this_seed,
                             save_locally=True,
+                            inpaint_enable=bool(use_inpaint),
+                            inpaint_image=inpaint_init_path or None,
+                            inpaint_mask=inpaint_mask_path or None,
+                            inpaint_denoise=float(inpaint_spec.get("inpaint_denoise", eff_denoise))
+                            if use_inpaint
+                            else None,
+                            inpaint_grow=int(inpaint_spec.get("inpaint_grow", 0))
+                            if use_inpaint
+                            else None,
+                            inpaint_blur=int(inpaint_spec.get("inpaint_blur", 0))
+                            if use_inpaint
+                            else None,
+                            inpaint_invert=bool(inpaint_spec.get("inpaint_invert", False))
+                            if use_inpaint
+                            else None,
                             hires_enable=bool(hires_on),
                             hires_upscaler=hires_up or "latent",
                             hires_scale=float(hires_sc),
@@ -1616,11 +2402,25 @@ def build_ui(cfg: WrapperConfig):
                                 "denoise": hires_dn,
                             },
                             adetailer={"enable": bool(ad_on), "model": ad_mod},
-                            img2img={"enable": bool(use_img2img), "denoise": eff_denoise},
+                            img2img={"enable": bool(use_img2img and not use_inpaint), "denoise": eff_denoise},
+                            inpaint={
+                                "enable": bool(use_inpaint),
+                                "denoise": inpaint_spec.get("inpaint_denoise", eff_denoise)
+                                if use_inpaint
+                                else eff_denoise,
+                                "grow": inpaint_spec.get("inpaint_grow", 0),
+                                "blur": inpaint_spec.get("inpaint_blur", 0),
+                                "invert": inpaint_spec.get("inpaint_invert", False),
+                            },
                         )
                         if count > 1 and seed_i < 0:
                             info += f"\nBatch {i + 1}/{count}"
-                        if use_img2img:
+                        if use_inpaint:
+                            info += (
+                                f"\nInpaint: {Path(inpaint_init_path).name} + "
+                                f"{Path(inpaint_mask_path).name}, denoise {eff_denoise}"
+                            )
+                        elif use_img2img:
                             info += f"\nimg2img: {Path(init_path).name}, denoise {eff_denoise}"
                         if anima_controls:
                             control = anima_controls[0]
@@ -1667,6 +2467,8 @@ def build_ui(cfg: WrapperConfig):
             steps, width, height, cfg_scale, batch_count, batch_size,
             seed, denoise, prefix,
             img2img_image, img2img_denoise,
+            inpaint_enable, inpaint_editor, inpaint_mask_upload,
+            inpaint_denoise, inpaint_grow, inpaint_blur, inpaint_invert,
             hires_enable, hires_upscaler, hires_scale, hires_steps, hires_denoise,
             anima_enable, anima_image, anima_preprocess, anima_canny_low, anima_canny_high,
             anima_model_patch, anima_strength, anima_start, anima_end,
@@ -1701,7 +2503,7 @@ def build_ui(cfg: WrapperConfig):
             outputs=[checkpoint, clip, clip2, vae, steps, cfg_scale, sampler, scheduler, width, height],
         )
 
-        def run_video(image_path, last_path, ref_img_files, ref_vid_files, ref_aud_files, mode_s, ref_size_s, prompt_s, width_v, height_v, auto_size, frames_v, steps_v, seed_v, unet_s, clip_s, vae_s, audio_vae_s, recipe_s, acc_s, loop_on, latent_on, rtx_on):
+        def run_video(image_path, last_path, ref_img_files, ref_vid_files, ref_aud_files, mode_s, ref_size_s, sam_target_s, sam3_s, source_start_s, source_end_s, reference_description_s, prompt_s, width_v, height_v, auto_size, frames_v, steps_v, seed_v, unet_s, clip_s, vae_s, audio_vae_s, recipe_s, acc_s, loop_on, save_latents_on, latent_on, rtx_on, megapixels_v, crossfade_v, ref_video_audio_on):
             if not ctx["busy"].acquire(blocking=False):
                 yield None, "Already running"
                 return
@@ -1717,19 +2519,46 @@ def build_ui(cfg: WrapperConfig):
 
             def worker():
                 try:
-                    is_r2v = str(mode_s or "i2v").lower() == "r2v"
-                    ref_imgs = _paths(ref_img_files)
-                    ref_vids = _paths(ref_vid_files)
-                    ref_auds = _paths(ref_aud_files)
-                    if is_r2v and image_path and not ref_imgs and not ref_vids:
-                        ref_imgs = [str(image_path)]
-                    if not is_r2v and not image_path:
-                        raise ValueError("Upload a first-frame still")
-                    if is_r2v and not image_path and not ref_imgs and not ref_vids and not (prompt_s or "").strip():
-                        raise ValueError("R2V needs a prompt or at least one reference")
-                    mp = ctx["cfg"].video.size_megapixels
-                    size_src = image_path or (ref_imgs[0] if ref_imgs else None)
-                    if auto_size and size_src:
+                    mode_key = normalize_video_mode(mode_s)
+                    is_head = is_head_swap_mode(mode_key)
+                    is_char = is_character_swap_mode(mode_key)
+                    is_r2v = mode_key in {"r2v", "r2v_frames"}
+                    is_guided = mode_key == "r2v_frames"
+                    is_text = mode_key == "t2v"
+                    ref_imgs = _paths(ref_img_files) if (is_r2v or is_char) else []
+                    ref_vids = _paths(ref_vid_files) if (is_r2v or is_head or is_char) else []
+                    ref_auds = _paths(ref_aud_files) if is_r2v else []
+                    if is_head and not image_path and not ref_imgs:
+                        raise ValueError("Head swap needs a face still (<Picture 1>)")
+                    if is_head and not ref_vids:
+                        raise ValueError("Head swap needs the source clip (<Video 1>)")
+                    if is_char and not image_path and not ref_imgs:
+                        raise ValueError("Character swap needs a character still (<Picture 1>)")
+                    if is_char and not ref_vids:
+                        raise ValueError("Character swap needs the source clip (<Video 1>)")
+                    if is_char and not str(sam_target_s or "").strip():
+                        raise ValueError("Character swap needs a SAM3 target (who to replace)")
+                    if is_char and not str(sam3_s or "").strip():
+                        raise ValueError("Character swap needs a SAM3 checkpoint filename")
+                    if mode_key == "i2v" and not (image_path or last_path):
+                        raise ValueError("Upload a start frame or an end frame")
+                    if is_r2v and not ((image_path and not is_guided) or ref_imgs or ref_vids or ref_auds):
+                        raise ValueError("Upload an appearance, motion or audio reference")
+                    if is_guided and not (image_path or last_path):
+                        raise ValueError("Upload a start or end frame guide")
+                    if not (prompt_s or "").strip() and (is_r2v or is_text):
+                        raise ValueError("Describe the scene and action to generate")
+                    mp = float(megapixels_v)
+                    size_src = (None if is_text else image_path) or (last_path if mode_key in {"i2v", "r2v_frames"} else None) or (ref_imgs[0] if ref_imgs else None)
+                    if (is_head or is_char) and auto_size and ref_vids:
+                        dims = video_frame_size(ref_vids[0])
+                        if dims:
+                            w, h = h3_size(dims[0], dims[1], megapixels=mp)
+                        elif size_src:
+                            w, h = target_dimensions(size_src, megapixels=mp)
+                        else:
+                            w, h = h3_size(width_v or 0, height_v or 0, fit=False)
+                    elif auto_size and size_src:
                         w, h = target_dimensions(size_src, megapixels=mp)
                     else:
                         w, h = h3_size(width_v or 0, height_v or 0, fit=False)
@@ -1740,21 +2569,37 @@ def build_ui(cfg: WrapperConfig):
                     def on_progress(msg):
                         result_q.put(("status", format_progress(msg)))
 
-                    result_q.put(("status", f"Queueing MiniMax H3 {'R2V-lite' if is_r2v else 'I2V'} at {w}×{h}..."))
+                    if is_char:
+                        kind_label = "character swap"
+                    elif is_head:
+                        kind_label = "head swap"
+                    elif is_r2v:
+                        kind_label = "reference + frames" if is_guided else "reference generation"
+                    elif is_text:
+                        kind_label = "text to video"
+                    else:
+                        kind_label = "I2V"
+                    result_q.put(("status", f"Queueing MiniMax H3 {kind_label} at {w}×{h}..."))
                     result = generate_video(
                         prompt_s,
-                        image=None if is_r2v else image_path,
-                        last_frame=None if is_r2v else last_path,
-                        mode="r2v" if is_r2v else "i2v",
-                        ref_images=ref_imgs if is_r2v else None,
-                        ref_videos=ref_vids if is_r2v else None,
+                        image=None if is_text else image_path,
+                        last_frame=last_path if mode_key in {"i2v", "r2v_frames"} else None,
+                        mode=mode_key,
+                        ref_images=ref_imgs or None,
+                        ref_videos=ref_vids or None,
                         ref_audios=ref_auds if is_r2v else None,
-                        ref_image_size=ref_size_s if is_r2v else None,
+                        sam_target=str(sam_target_s or "") if is_char else None,
+                        sam3_checkpoint=str(sam3_s or "") if is_char else None,
+                        source_start=float(source_start_s or 0) if (is_head or is_char) else None,
+                        source_end=float(source_end_s or 0) if (is_head or is_char) else None,
+                        reference_description=reference_description_s if (is_char or is_r2v) else None,
+                        ref_image_size=ref_size_s if (is_r2v or is_head or is_char) else None,
+                        include_reference_video_audio=bool(ref_video_audio_on) if is_r2v else False,
                         seed=int(seed_v) if seed_v is not None else -1,
-                        steps=int(steps_v),
+                        steps=int(steps_v) if recipe_s in {"native", "ref_native"} and not (is_char or is_head) else None,
                         width=w,
                         height=h,
-                        frames=int(frames_v),
+                        frames=None if (is_head or is_char) else h3_frame_count(round(float(frames_v) * 24)),
                         unet=unet_s,
                         clip=clip_s,
                         vae=vae_s,
@@ -1762,6 +2607,9 @@ def build_ui(cfg: WrapperConfig):
                         recipe=recipe_s,
                         acc_file=acc_s or "",
                         loop=bool(loop_on),
+                        size_megapixels=mp,
+                        crossfade_frames=int(crossfade_v),
+                        save_latents=bool(save_latents_on),
                         latent_upscale=bool(latent_on),
                         rtx_vsr=bool(rtx_on),
                         cfg=ctx["cfg"],
@@ -1797,17 +2645,16 @@ def build_ui(cfg: WrapperConfig):
                     yield video_path, note
                     break
 
-        def on_video_recipe(recipe_key, unet_s):
-            files = ctx.get("acc_files") or []
-            rec, steps, acc = video_recipe_ui(
-                recipe_key, unet_s, files, ctx["cfg"].video.acc_file,
-            )
-            choices = prefer_first(files, acc) if rec.acc else ([""] + prefer_first(files, None))
-            return steps, gr.update(choices=choices, value=acc)
+        def on_video_recipe(recipe_key, unet_s, mode_s):
+            opt = video_workflow_options(mode_s, ctx["cfg"].video, unets=ctx.get("video_unets", []),
+                                         acc_files=ctx.get("acc_files", []), loras=ctx.get("loras", []), recipe=recipe_key)
+            _rec, _steps, acc = video_recipe_ui(opt["recipe"], unet_s, ctx.get("acc_files", []))
+            return (gr.update(value=opt["steps"], visible=opt["steps_visible"]),
+                    gr.update(choices=[acc] if acc else [""], value=acc, visible=False))
 
-        v_recipe.change(
+        v_recipe.input(
             on_video_recipe,
-            inputs=[v_recipe, v_unet],
+            inputs=[v_recipe, v_unet, v_mode],
             outputs=[v_steps, v_acc],
         )
 
@@ -1820,36 +2667,279 @@ def build_ui(cfg: WrapperConfig):
                 return ""
             return acc
 
-        v_unet.change(on_video_unet, inputs=[v_unet, v_recipe], outputs=[v_acc])
+        v_unet.input(on_video_unet, inputs=[v_unet, v_recipe], outputs=[v_acc])
 
-        def on_video_size_from_image(image_path, auto):
-            if not auto or not image_path:
-                return gr.update(), gr.update()
+        def on_video_size_from_image(image_path, auto, mode_s, ref_vid_files, last_path, ref_img_files, megapixels_v):
+            auto = bool(auto) and normalize_video_mode(mode_s) != "t2v"
+            unchanged = (gr.update(interactive=not auto), gr.update(interactive=not auto), gr.update(visible=auto))
+            if not auto:
+                return unchanged
             try:
-                w, h = target_dimensions(image_path, megapixels=ctx["cfg"].video.size_megapixels)
+                is_char = is_character_swap_mode(mode_s)
+                if is_char or is_head_swap_mode(mode_s):
+                    files = [ref_vid_files] if isinstance(ref_vid_files, (str, Path)) else list(ref_vid_files or [])
+                    if not files:
+                        return unchanged
+                    dims = video_frame_size(str(getattr(files[0], "name", files[0])))
+                    if not dims:
+                        return unchanged
+                    w, h = h3_size(*dims, megapixels=float(megapixels_v))
+                elif normalize_video_mode(mode_s) == "t2v":
+                    return unchanged
+                else:
+                    refs = [ref_img_files] if isinstance(ref_img_files, (str, Path)) else list(ref_img_files or [])
+                    size_source = image_path or (last_path if mode_s in {"i2v", "r2v_frames"} else None)
+                    if not size_source and mode_s in {"r2v", "r2v_frames"} and refs:
+                        size_source = str(getattr(refs[0], "name", refs[0]))
+                    if not size_source:
+                        return unchanged
+                    w, h = target_dimensions(size_source, megapixels=float(megapixels_v))
             except Exception:
-                return gr.update(), gr.update()
-            return w, h
+                return unchanged
+            return gr.update(value=w, interactive=False), gr.update(value=h, interactive=False), gr.update(visible=True)
 
-        v_image.change(
-            on_video_size_from_image,
-            inputs=[v_image, v_auto_size],
-            outputs=[v_width, v_height],
-        )
-        v_auto_size.change(
-            on_video_size_from_image,
-            inputs=[v_image, v_auto_size],
-            outputs=[v_width, v_height],
+        def on_video_mode(mode_s, image_path, auto, ref_vid_files, last_path, ref_img_files, megapixels_v, previous_role, prompt_s, previous_prompt_default):
+            mode_s = normalize_video_mode(mode_s)
+            is_char = is_character_swap_mode(mode_s)
+            is_head = is_head_swap_mode(mode_s)
+            is_swap = is_char or is_head
+            is_r2v = mode_s in {"r2v", "r2v_frames"}
+            is_guided = mode_s == "r2v_frames"
+            prompt_default = video_prompt_default(ctx["cfg"].video, mode_s)
+            prompt_update = {"value": prompt_default} if str(prompt_s or "").strip() == str(previous_prompt_default or "").strip() else {}
+            role = "appearance" if is_char or is_head or mode_s == "r2v" else "text" if mode_s == "t2v" else "frame"
+            clear_image = bool(image_path) and previous_role != role
+            refs_update = {}
+            if clear_image:
+                if is_guided and previous_role == "appearance":
+                    refs = [ref_img_files] if isinstance(ref_img_files, (str, Path)) else list(ref_img_files or [])
+                    refs = [str(getattr(p, "name", p)) for p in refs]
+                    ref_img_files = list(dict.fromkeys([str(image_path), *refs]))
+                    refs_update["value"] = ref_img_files
+                image_path = None
+            video_files = [ref_vid_files] if isinstance(ref_vid_files, (str, Path)) else list(ref_vid_files or [])
+            video_files = [str(getattr(p, "name", p)) for p in video_files]
+            # gr.File's backend data model is fixed at construction. Changing
+            # file_count to single here makes the browser send FileData to a
+            # ListFiles backend, which fails before run_video can execute.
+            ref_vid_files = video_files or None
+            opt = video_workflow_options(mode_s, ctx["cfg"].video, unets=ctx.get("video_unets", []),
+                                         acc_files=ctx.get("acc_files", []), loras=ctx.get("loras", []))
+            mp = ctx["cfg"].video.character_swap_size_megapixels if is_char else ctx["cfg"].video.size_megapixels
+            w, h, _mp_update = on_video_size_from_image(image_path, auto, mode_s, ref_vid_files, last_path, ref_img_files, mp)
+            image_label = ("Replacement character appearance (<Picture 1>)" if is_char else
+                           "Replacement face picture" if is_head else
+                           "Primary appearance reference (<Picture 1>)" if mode_s == "r2v" else
+                           "Start frame guide (optional)" if is_guided else "Start frame (optional if an end frame is supplied)")
+            return (
+                gr.update(label=image_label, visible=mode_s != "t2v", **({"value": None} if clear_image else {})),
+                gr.update(label="End frame guide (optional)" if is_guided else "End frame (optional)", visible=mode_s == "i2v" or is_guided),
+                gr.update(label="Appearance references (<Picture 1> onward; max 9)" if is_guided else "Additional appearance pictures (max 9 total, including the primary)", visible=is_r2v or is_char, **refs_update),
+                gr.update(label="Source video to edit (exactly one)" if is_swap else "Motion / camera reference videos (optional, max 3)", visible=is_swap or is_r2v, file_count="multiple", value=ref_vid_files),
+                gr.update(visible=is_r2v),
+                gr.update(label="Who to replace in the source video", visible=is_char),
+                gr.update(visible=is_swap), gr.update(label="Character / appearance details (optional)", visible=is_char or is_r2v),
+                gr.update(visible=is_swap), gr.update(visible=is_swap),
+                gr.update(visible=not is_swap),
+                gr.update(choices=opt["recipes"], value=opt["recipe"], visible=not is_swap),
+                gr.update(choices=[opt["acc"]], value=opt["acc"], visible=False),
+                gr.update(choices=opt["models"], value=opt["model"], visible=not is_swap and len(opt["models"]) > 1),
+                gr.update(value=ctx["cfg"].video.character_swap_vae if is_char else initial["v_vae"], visible=not is_swap and len(initial["v_vaes"]) > 1),
+                gr.update(value=opt["steps"], visible=opt["steps_visible"]),
+                gr.update(value=False, visible=not is_swap and not is_guided and not (mode_s == "i2v" and last_path)),
+                gr.update(label="Match the source video's aspect ratio" if is_swap else "Match the reference's aspect ratio" if mode_s == "r2v" else "Match the frame's aspect ratio", visible=mode_s != "t2v"),
+                gr.update(label="Additional edit instructions (optional)" if is_swap else "Scene, action and sound to generate" if is_r2v or mode_s == "t2v" else "Motion and sound to generate", **prompt_update),
+                w, h,
+                gr.update(visible=is_r2v or is_swap),
+                opt["hint"],
+                gr.update(value=mp, visible=bool(auto) and mode_s != "t2v"),
+                gr.update(value="Swap character" if is_char else "Swap head" if is_head else "Generate video"),
+                gr.update(visible=False),
+                role,
+                prompt_default,
+                gr.update(visible=is_r2v),
+            )
+
+        initial_mode = normalize_video_mode(cfg.video.mode)
+        v_input_role = gr.State("appearance" if initial_mode in {"r2v", "headswap", "charswap"} else "text" if initial_mode == "t2v" else "frame")
+        v_prompt_default = gr.State(video_prompt_default(cfg.video, initial_mode))
+        mode_inputs = [v_mode, v_image, v_auto_size, v_ref_video, v_last, v_ref_images, v_megapixels, v_input_role, v_prompt, v_prompt_default]
+        mode_outputs = [v_image, v_last, v_ref_images, v_ref_video, v_ref_audio,
+                     v_sam_target, v_swap_trim, v_reference_description,
+                     v_source_preview, v_swap_hint, v_frames, v_recipe, v_acc,
+                     v_unet, v_vae, v_steps, v_loop, v_auto_size, v_prompt, v_width, v_height,
+                     v_ref_size, v_workflow_hint, v_megapixels, v_generate, v_crossfade, v_input_role, v_prompt_default, v_ref_video_audio]
+        v_mode.change(on_video_mode, inputs=mode_inputs, outputs=mode_outputs)
+        demo.load(on_video_mode, inputs=mode_inputs, outputs=mode_outputs)
+        refresh_event.then(on_video_mode, inputs=mode_inputs, outputs=mode_outputs)
+
+        size_inputs = [v_image, v_auto_size, v_mode, v_ref_video, v_last, v_ref_images, v_megapixels]
+        for size_control in (v_image, v_last, v_auto_size, v_megapixels, v_ref_images):
+            size_control.change(on_video_size_from_image, inputs=size_inputs, outputs=[v_width, v_height, v_megapixels])
+
+        def on_video_loop(loop_on, mode_s, last_path):
+            mode_s = normalize_video_mode(mode_s)
+            allowed = mode_s in {"i2v", "r2v", "t2v"} and not (mode_s == "i2v" and last_path)
+            return gr.update(value=bool(loop_on) and allowed, visible=allowed), gr.update(visible=bool(loop_on) and allowed)
+
+        v_loop.input(on_video_loop, inputs=[v_loop, v_mode, v_last], outputs=[v_loop, v_crossfade])
+        v_last.change(on_video_loop, inputs=[v_loop, v_mode, v_last], outputs=[v_loop, v_crossfade])
+
+        def on_video_source_preview(files):
+            files = [files] if isinstance(files, (str, Path)) else list(files or [])
+            return str(getattr(files[0], "name", files[0])) if files else None
+
+        v_ref_video.change(on_video_source_preview, inputs=[v_ref_video], outputs=[v_source_preview])
+        v_ref_video.change(
+            on_video_size_from_image, inputs=size_inputs,
+            outputs=[v_width, v_height, v_megapixels],
         )
 
         v_generate.click(
             run_video,
             inputs=[
                 v_image, v_last, v_ref_images, v_ref_video, v_ref_audio, v_mode, v_ref_size,
+                v_sam_target, v_sam3,
+                v_source_start, v_source_end, v_reference_description,
                 v_prompt, v_width, v_height, v_auto_size, v_frames, v_steps, v_seed,
-                v_unet, v_clip, v_vae, v_audio_vae, v_recipe, v_acc, v_loop, v_latent_up, v_rtx,
+                v_unet, v_clip, v_vae, v_audio_vae, v_recipe, v_acc, v_loop, v_save_latents, v_latent_up, v_rtx,
+                v_megapixels, v_crossfade, v_ref_video_audio,
             ],
             outputs=[v_video, v_status],
+        )
+
+        def run_upscale(drop_file, mode_s):
+            from comfyui_wrapper.h3 import resolve_dropped_latent_pair
+            from comfyui_wrapper.video import upscale_dropped_file
+
+            if not ctx["busy"].acquire(blocking=False):
+                yield None, "Already running — wait or Interrupt."
+                return
+            ctx["stop"].clear()
+            result_q: queue.Queue = queue.Queue()
+
+            def _all_paths(value):
+                if not value:
+                    return []
+                items = value if isinstance(value, list) else [value]
+                paths: list[str] = []
+                for item in items:
+                    text = ""
+                    if isinstance(item, (str, Path)):
+                        text = str(item).strip()
+                    elif isinstance(item, dict):
+                        for key in ("path", "name", "filename", "orig_name", "url"):
+                            cand = item.get(key)
+                            if isinstance(cand, str) and cand.strip():
+                                text = cand.strip()
+                                break
+                    else:
+                        cand = getattr(item, "name", None)
+                        if isinstance(cand, (str, Path)) and str(cand).strip():
+                            full = str(item).strip()
+                            name = str(cand).strip()
+                            try:
+                                if Path(full).is_file():
+                                    text = full
+                                elif Path(name).is_file():
+                                    text = name
+                                else:
+                                    text = full or name
+                            except OSError:
+                                text = name
+                        else:
+                            try:
+                                text = str(item).strip()
+                            except Exception:
+                                continue
+                    if text:
+                        paths.append(text)
+                return paths
+
+            def worker():
+                try:
+                    paths = [p for p in _all_paths(drop_file) if Path(p).is_file()]
+                    if not paths:
+                        raise ValueError("Drop *_video.latent + *_audio.latent (3D 2x) or a rendered clip (RTX VSR)")
+                    client = live_client()
+                    if not client.ping():
+                        raise ComfyError(f"ComfyUI is not reachable at {ctx['cfg'].comfyui.base_url}")
+
+                    def on_progress(msg):
+                        result_q.put(("status", format_progress(msg)))
+
+                    want = str(mode_s or "auto").lower()
+                    # Auto-detect from the drop: any latent means 3D path,
+                    # otherwise the first clip is the RTX path.
+                    latents = [p for p in paths if Path(p).suffix.lower() in {".latent", ".safetensors"}]
+                    if want in {"", "auto", "detect", "single"}:
+                        probe = latents[0] if latents else paths[0]
+                    else:
+                        probe = paths[0]
+                    from comfyui_wrapper.h3 import detect_upscale_kind
+
+                    kind_probe = want if want in {"latent", "rtx", "clip"} else detect_upscale_kind(probe)
+                    src = paths[0]
+                    audio_src: str | None = None
+                    if kind_probe in {"latent", "3d", "3d_latent", "latent_upscale", "h3"} or (
+                        want in {"", "auto", "detect", "single"} and latents
+                    ):
+                        video_p, audio_p = resolve_dropped_latent_pair(paths)
+                        if video_p is None:
+                            raise ValueError("Drop the *_video.latent half (plus *_audio.latent for audio)")
+                        src = str(video_p)
+                        audio_src = str(audio_p) if audio_p is not None else None
+                        if audio_src is None:
+                            result_q.put(("status", "No *_audio.latent found — upscaling silent..."))
+                        else:
+                            result_q.put(
+                                (
+                                    "status",
+                                    f"Found video {Path(src).name} + audio {Path(audio_src).name} — upscaling with audio...",
+                                )
+                            )
+                    result_q.put(("status", f"Upscaling ({want})..."))
+                    out, kind = upscale_dropped_file(
+                        src,
+                        None,
+                        mode=want,
+                        audio_source=audio_src,
+                        client=client,
+                        cfg=ctx["cfg"],
+                        on_progress=on_progress,
+                    )
+                    if kind == "latent":
+                        label = "3D latent 2x + audio" if audio_src else "3D latent 2x silent (no *_audio.latent)"
+                    else:
+                        label = "RTX VSR 2x"
+                    result_q.put(("done", (str(out), f"Done ({label}): {Path(out).name}")))
+                except Exception as exc:
+                    result_q.put(("error", str(exc)))
+                finally:
+                    ctx["busy"].release()
+
+            threading.Thread(target=worker, daemon=True).start()
+            video_path = None
+            yield None, "Starting..."
+            while True:
+                kind, payload = result_q.get()
+                if ctx["stop"].is_set():
+                    yield video_path, "Stopped"
+                    break
+                if kind == "status":
+                    yield video_path, payload
+                elif kind == "error":
+                    yield video_path, f"Error: {payload}"
+                    break
+                elif kind == "done":
+                    video_path, note = payload
+                    yield video_path, note
+                    break
+
+        up_run.click(
+            run_upscale,
+            inputs=[up_file, up_mode],
+            outputs=[up_video, up_status],
         )
 
         def _batch_cfg(checkpoint_s, workflow_s, sampler_s, scheduler_s, steps_v,

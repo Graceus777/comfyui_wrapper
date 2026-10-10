@@ -1,8 +1,8 @@
 {
   "1": {
     "class_type": "UNETLoader",
-    "_meta": { "title": "H3 UNET (FL2VA lite)" },
-    "inputs": { "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default" }
+    "_meta": { "title": "H3 Ref2VA model" },
+    "inputs": { "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default" }
   },
   "2": {
     "class_type": "CLIPLoader",
@@ -26,7 +26,7 @@
   },
   "6": {
     "class_type": "MiniMaxH3ReferenceToVideo",
-    "_meta": { "title": "H3 R2V (FL2VA lite)" },
+    "_meta": { "title": "H3 appearance references" },
     "inputs": {
       "clip": ["2", 0],
       "vae": ["3", 0],
@@ -52,7 +52,7 @@
   },
   "10": {
     "class_type": "BasicScheduler",
-    "inputs": { "model": ["16", 0], "scheduler": "simple", "steps": 12, "denoise": 1.0 }
+    "inputs": { "model": ["16", 0], "scheduler": "normal", "steps": 20, "denoise": 1.0 }
   },
   "11": {
     "class_type": "SamplerCustomAdvanced",

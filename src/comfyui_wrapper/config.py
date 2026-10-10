@@ -70,6 +70,15 @@ DEFAULTS: dict[str, Any] = {
             "cfg": 5.0,
             "guide_size": 512,
         },
+        "inpaint": {
+            "enable": False,
+            "image": "",
+            "mask": "",
+            "denoise": 0.75,
+            "grow": 0,
+            "blur": 4,
+            "invert": False,
+        },
     },
     "batch": {
         "random_count": 1,
@@ -84,6 +93,11 @@ DEFAULTS: dict[str, Any] = {
     "video": {
         "workflow": "minimax_h3_i2v_loop.api.json",
         "r2v_workflow": "minimax_h3_r2v_loop.api.json",
+        "r2v_unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "ref_recipe": "ref_native",
+        "ref_steps": 20,
+        "ref_turbo4_lora": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "ref_turbo8_lora": "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
         "mode": "i2v",
         "recipe": "acc",
         "unet": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
@@ -102,8 +116,9 @@ DEFAULTS: dict[str, Any] = {
         "height": 480,
         "size_megapixels": 0.52,
         "ref_image_size": "match",
-        "loop": True,
+        "loop": False,
         "crossfade_frames": 12,
+        "save_latents": True,
         "latent_upscale": False,
         "latent_upscale_model": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
         "latent_upscale_scale": 2.0,
@@ -115,6 +130,27 @@ DEFAULTS: dict[str, Any] = {
             "from the reference image. Natural continuous environmental motion only; "
             "no camera cut, zoom, reversal, or end freeze."
         ),
+    },
+    "qwen_image": {
+        "workflow": "qwen_image_2_1.api.json",
+        "unet": "qwen_image_2.1-Q6_K.gguf",
+        "clip": "qwen3vl_8b_w4a8.safetensors",
+        "vae": "qwen_image_2.1_vae_bf16.safetensors",
+        "steps": 25,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "width": 1024,
+        "height": 1024,
+        "resolution": 1024,
+        "batch_size": 1,
+        "seed": -1,
+        "filename_prefix": "qwen_image_2_1",
+        "cache_device": "auto",
+        "cache_dtype": "default",
+        "match_reference": True,
+        "prompt": "",
+        "negative": "",
     },
 }
 
@@ -216,12 +252,40 @@ class GenerationSettings:
     adetailer_steps: int = 20
     adetailer_cfg: float = 5.0
     adetailer_guide_size: int = 512
+    inpaint_enable: bool = False
+    inpaint_image: str = ""
+    inpaint_mask: str = ""
+    inpaint_denoise: float = 0.75
+    inpaint_grow: int = 0
+    inpaint_blur: int = 4
+    inpaint_invert: bool = False
 
 
 @dataclass
 class VideoSettings:
     workflow_file: str = "minimax_h3_i2v_loop.api.json"
     r2v_workflow_file: str = "minimax_h3_r2v_loop.api.json"
+    r2v_unet: str = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    ref_recipe: str = "ref_native"
+    ref_steps: int = 20
+    ref_video_audio: bool = True
+    ref_turbo4_lora: str = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+    ref_turbo8_lora: str = "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+    head_swap_workflow_file: str = "minimax_h3_head_swap.api.json"
+    head_swap_unet: str = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+    head_swap_lora: str = "minimax_h3_head_swap_v1.0_r32.safetensors"
+    head_swap_strength: float = 1.0
+    character_swap_workflow_file: str = "minimax_h3_character_swap.api.json"
+    character_swap_unet: str = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    character_swap_lora: str = "minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors"
+    character_swap_lora_strength: float = 1.0
+    character_swap_vae: str = "minimax_h3_video_vae_int8_convrot.safetensors"
+    character_swap_shift_video: float = 6.0
+    character_swap_size_megapixels: float = 0.8
+    swap_source_start: float = 0.0
+    swap_source_end: float = 3.0
+    sam3_checkpoint: str = "sam3.1_multiplex_fp16.safetensors"
+    sam3_target: str = ""
     mode: str = "i2v"
     recipe: str = "acc"
     unet: str = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
@@ -240,8 +304,9 @@ class VideoSettings:
     height: int = 480
     size_megapixels: float = 0.52
     ref_image_size: str = "match"
-    loop: bool = True
+    loop: bool = False
     crossfade_frames: int = 12
+    save_latents: bool = True
     latent_upscale: bool = False
     latent_upscale_model: str = "minimax_h3_latent_upscaler_3d_fp16.safetensors"
     latent_upscale_scale: float = 2.0
@@ -249,6 +314,32 @@ class VideoSettings:
     rtx_vsr_scale: float = 2.0
     rtx_vsr_quality: str = "ULTRA"
     prompt: str = ""
+    reference_prompt: str = ""
+    swap_prompt: str = ""
+    text_prompt: str = ""
+
+
+@dataclass
+class QwenImageSettings:
+    workflow_file: str = "qwen_image_2_1.api.json"
+    unet: str = "qwen_image_2.1-Q6_K.gguf"
+    clip: str = "qwen3vl_8b_w4a8.safetensors"
+    vae: str = "qwen_image_2.1_vae_bf16.safetensors"
+    steps: int = 25
+    cfg: float = 1.0
+    sampler: str = "euler"
+    scheduler: str = "simple"
+    width: int = 1024
+    height: int = 1024
+    resolution: int = 1024
+    batch_size: int = 1
+    seed: int = -1
+    filename_prefix: str = "qwen_image_2_1"
+    cache_device: str = "auto"
+    cache_dtype: str = "default"
+    match_reference: bool = True
+    prompt: str = ""
+    negative: str = ""
 
 
 @dataclass
@@ -274,6 +365,7 @@ class WrapperConfig:
     generation: GenerationSettings = field(default_factory=GenerationSettings)
     batch: BatchSettings = field(default_factory=BatchSettings)
     video: VideoSettings = field(default_factory=VideoSettings)
+    qwen: QwenImageSettings = field(default_factory=QwenImageSettings)
 
     def video_workflow_path(self) -> Path:
         given = Path(self.video.workflow_file)
@@ -283,6 +375,24 @@ class WrapperConfig:
 
     def r2v_workflow_path(self) -> Path:
         given = Path(self.video.r2v_workflow_file)
+        if given.is_absolute() and given.exists():
+            return given
+        return self.paths.workflows / given.name
+
+    def head_swap_workflow_path(self) -> Path:
+        given = Path(self.video.head_swap_workflow_file)
+        if given.is_absolute() and given.exists():
+            return given
+        return self.paths.workflows / given.name
+
+    def character_swap_workflow_path(self) -> Path:
+        given = Path(self.video.character_swap_workflow_file)
+        if given.is_absolute() and given.exists():
+            return given
+        return self.paths.workflows / given.name
+
+    def qwen_workflow_path(self) -> Path:
+        given = Path(self.qwen.workflow_file)
         if given.is_absolute() and given.exists():
             return given
         return self.paths.workflows / given.name
@@ -323,8 +433,10 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
     )
     g = merged["generation"]
     v = merged.get("video") if isinstance(merged.get("video"), dict) else {}
+    q = merged.get("qwen_image") if isinstance(merged.get("qwen_image"), dict) else {}
     hires = g.get("hires") if isinstance(g.get("hires"), dict) else {}
     ad = g.get("adetailer") if isinstance(g.get("adetailer"), dict) else {}
+    inp = g.get("inpaint") if isinstance(g.get("inpaint"), dict) else {}
     b = merged["batch"]
     c = merged["comfyui"]
     w = merged["workflow"]
@@ -373,6 +485,13 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             adetailer_steps=int(ad.get("steps") if ad.get("steps") is not None else 20),
             adetailer_cfg=float(ad.get("cfg") if ad.get("cfg") is not None else 5.0),
             adetailer_guide_size=int(ad.get("guide_size") if ad.get("guide_size") is not None else 512),
+            inpaint_enable=bool(inp.get("enable", g.get("inpaint_enable") or False)),
+            inpaint_image=str(inp.get("image") or g.get("inpaint_image") or ""),
+            inpaint_mask=str(inp.get("mask") or g.get("inpaint_mask") or ""),
+            inpaint_denoise=float(inp.get("denoise") if inp.get("denoise") is not None else g.get("inpaint_denoise", 0.75)),
+            inpaint_grow=int(inp.get("grow") if inp.get("grow") is not None else g.get("inpaint_grow", 0)),
+            inpaint_blur=int(inp.get("blur") if inp.get("blur") is not None else g.get("inpaint_blur", 4)),
+            inpaint_invert=bool(inp.get("invert", g.get("inpaint_invert") or False)),
         ),
         batch=BatchSettings(
             random_count=int(b["random_count"]),
@@ -385,8 +504,55 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             in_flight=max(1, int(b.get("in_flight") or 1)),
         ),
         video=VideoSettings(
+            r2v_unet=str(v.get("r2v_unet") or "minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
+            ref_recipe=normalize_recipe(v.get("ref_recipe") or "ref_native"),
+            ref_steps=int(v.get("ref_steps") or 20),
+            ref_video_audio=bool(v.get("ref_video_audio", True)),
+            ref_turbo4_lora=str(v.get("ref_turbo4_lora") or "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"),
+            ref_turbo8_lora=str(v.get("ref_turbo8_lora") or "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"),
             workflow_file=str(v.get("workflow") or "minimax_h3_i2v_loop.api.json"),
             r2v_workflow_file=str(v.get("r2v_workflow") or "minimax_h3_r2v_loop.api.json"),
+            head_swap_workflow_file=str(
+                v.get("head_swap_workflow") or "minimax_h3_head_swap.api.json"
+            ),
+            head_swap_unet=str(
+                v.get("head_swap_unet")
+                or "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+            ),
+            head_swap_lora=str(
+                v.get("head_swap_lora") or "minimax_h3_head_swap_v1.0_r32.safetensors"
+            ),
+            head_swap_strength=float(
+                v.get("head_swap_strength") if v.get("head_swap_strength") is not None else 1.0
+            ),
+            character_swap_workflow_file=str(
+                v.get("character_swap_workflow") or "minimax_h3_character_swap.api.json"
+            ),
+            character_swap_unet=str(
+                v.get("character_swap_unet") or "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+            ),
+            character_swap_lora=str(
+                v.get("character_swap_lora")
+                or "minimax_h3_turbo_v4_step600_pruned_comfyui.safetensors"
+            ),
+            character_swap_lora_strength=float(
+                v.get("character_swap_lora_strength")
+                if v.get("character_swap_lora_strength") is not None
+                else 1.0
+            ),
+            character_swap_vae=str(
+                v.get("character_swap_vae") or "minimax_h3_video_vae_int8_convrot.safetensors"
+            ),
+            character_swap_shift_video=float(
+                v.get("character_swap_shift_video")
+                if v.get("character_swap_shift_video") is not None
+                else 6.0
+            ),
+            character_swap_size_megapixels=float(v.get("character_swap_size_megapixels", 0.8)),
+            swap_source_start=float(v.get("swap_source_start", 0.0)),
+            swap_source_end=float(v.get("swap_source_end", 3.0)),
+            sam3_checkpoint=str(v.get("sam3_checkpoint") or "sam3.1_multiplex_fp16.safetensors"),
+            sam3_target=str(v.get("sam3_target") or ""),
             mode=str(v.get("mode") or "i2v").strip().lower(),
             recipe=normalize_recipe(v.get("recipe") or "acc"),
             unet=str(v.get("unet") or "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"),
@@ -406,8 +572,9 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             size_megapixels=float(
                 v.get("size_megapixels") if v.get("size_megapixels") is not None else 0.52
             ),
-            loop=bool(v.get("loop") if v.get("loop") is not None else True),
+            loop=bool(v.get("loop") if v.get("loop") is not None else False),
             crossfade_frames=int(v.get("crossfade_frames") or 12),
+            save_latents=bool(v.get("save_latents") if v.get("save_latents") is not None else True),
             latent_upscale=bool(v.get("latent_upscale") or False),
             latent_upscale_model=str(
                 v.get("latent_upscale_model") or "minimax_h3_latent_upscaler_3d_fp16.safetensors"
@@ -419,7 +586,31 @@ def from_dict(data: dict, *, source: Path | None = None, root: Path | None = Non
             rtx_vsr_scale=float(v.get("rtx_vsr_scale") if v.get("rtx_vsr_scale") is not None else 2.0),
             rtx_vsr_quality=str(v.get("rtx_vsr_quality") or "ULTRA"),
             prompt=str(v.get("prompt") or ""),
+            reference_prompt=str(v.get("reference_prompt") or ""),
+            swap_prompt=str(v.get("swap_prompt") or ""),
+            text_prompt=str(v.get("text_prompt") or ""),
             ref_image_size=str(v.get("ref_image_size") or "match").strip().lower(),
+        ),
+        qwen=QwenImageSettings(
+            workflow_file=str(q.get("workflow") or "qwen_image_2_1.api.json"),
+            unet=str(q.get("unet") or "qwen_image_2.1-Q6_K.gguf"),
+            clip=str(q.get("clip") or "qwen3vl_8b_w4a8.safetensors"),
+            vae=str(q.get("vae") or "qwen_image_2.1_vae_bf16.safetensors"),
+            steps=int(q.get("steps") or 25),
+            cfg=float(q.get("cfg") if q.get("cfg") is not None else 1.0),
+            sampler=str(q.get("sampler") or "euler"),
+            scheduler=str(q.get("scheduler") or "simple"),
+            width=int(q.get("width") or 1024),
+            height=int(q.get("height") or 1024),
+            resolution=int(q.get("resolution") if q.get("resolution") is not None else 1024),
+            batch_size=max(1, int(q.get("batch_size") or 1)),
+            seed=int(q.get("seed") if q.get("seed") is not None else -1),
+            filename_prefix=str(q.get("filename_prefix") or "qwen_image_2_1"),
+            cache_device=str(q.get("cache_device") or "auto").strip().lower(),
+            cache_dtype=str(q.get("cache_dtype") or "default").strip().lower(),
+            match_reference=bool(q.get("match_reference") if q.get("match_reference") is not None else True),
+            prompt=str(q.get("prompt") or ""),
+            negative=str(q.get("negative") or ""),
         ),
     )
 
@@ -456,6 +647,7 @@ def apply_overrides(config: WrapperConfig, **kwargs: Any) -> WrapperConfig:
         "video_workflow", "video_unet", "video_clip", "video_vae", "video_audio_vae",
         "video_recipe", "video_acc_file", "frames", "fps", "length", "loop",
         "crossfade_frames", "shift_video", "shift_audio", "size_megapixels",
+        "save_latents",
         "latent_upscale", "latent_upscale_model", "latent_upscale_scale",
         "rtx_vsr", "rtx_vsr_scale", "rtx_vsr_quality", "video_mode", "mode",
         "r2v_workflow", "video_r2v_workflow", "ref_image_size",
@@ -472,6 +664,13 @@ def apply_overrides(config: WrapperConfig, **kwargs: Any) -> WrapperConfig:
         "adetailer_steps": ("adetailer", "steps"),
         "adetailer_cfg": ("adetailer", "cfg"),
         "adetailer_guide_size": ("adetailer", "guide_size"),
+        "inpaint_enable": ("inpaint", "enable"),
+        "inpaint_image": ("inpaint", "image"),
+        "inpaint_mask": ("inpaint", "mask"),
+        "inpaint_denoise": ("inpaint", "denoise"),
+        "inpaint_grow": ("inpaint", "grow"),
+        "inpaint_blur": ("inpaint", "blur"),
+        "inpaint_invert": ("inpaint", "invert"),
     }
     batch_keys = {
         "random_count", "batch_count", "cooldown_s", "skip_exists",
@@ -485,7 +684,7 @@ def apply_overrides(config: WrapperConfig, **kwargs: Any) -> WrapperConfig:
         elif key in nested_keys:
             section, sub = nested_keys[key]
             raw.setdefault("generation", {}).setdefault(section, {})[sub] = value
-        elif key in {"hires", "adetailer"} and isinstance(value, dict):
+        elif key in {"hires", "adetailer", "inpaint"} and isinstance(value, dict):
             dest = raw.setdefault("generation", {}).setdefault(key, {})
             dest.update(value)
         elif key in batch_keys:
