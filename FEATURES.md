@@ -1,11 +1,12 @@
 # Feature inventory
 
-`comfyui_wrapper` is a config-driven Python client and local WebUI for a
-running ComfyUI server. It keeps the authored workflow graph in API-format
-JSON and applies run-specific settings by patching a copy of that graph. It
-does not automatically download models or install ComfyUI custom nodes.
-An explicit, opt-in setup script installs the pinned dependencies for the
-[dedicated workflow tools](workflows/containers/README.md).
+`comfyui_wrapper` is a config-driven Python client, CLI, and local WebUI for
+ComfyUI image/video jobs, plus a separate local voice-cloning worker. It
+keeps authored workflow graphs in API-format JSON and applies run-specific
+settings by patching a copy. Generation does not automatically download
+models or install ComfyUI custom nodes. Explicit, opt-in setup scripts install
+the [dedicated workflow dependencies](workflows/containers/README.md) or the
+[voice runtime and model package](docs/voice-clone.md).
 
 This document describes the capabilities implemented in the current source.
 The matching ComfyUI nodes, model files, and optional command-line tools must
@@ -16,6 +17,13 @@ already be available in the environment where a job runs.
 - Dedicated **Voice Clone** tab and `comfywrap tts` CLI with dots.tts-SOAR.
 - Best-match continuation from reference audio plus its exact transcript, or
   audio-only speaker cloning. Clean 3–10 second recordings are recommended.
+- Reference recording through the WebUI microphone or file upload; reference
+  duration is checked by the worker before inference.
+- Language selectors for English, Chinese, Spanish, French, German, Japanese,
+  Korean, or automatic detection. The worker passes the selected language to
+  SOAR; quality depends on the reference and model.
+- NFE sampling steps (10–32), CFG guidance (0–3), seed, and output-duration
+  limit (3–30 seconds), with these settings retained in generation details.
 - Local mono 48 kHz WAV output, retained reference, generation settings,
   timing, GPU memory measurements, and worker log.
 - Isolated Python 3.12/CUDA runtime, offline generation after explicit setup,
@@ -134,6 +142,23 @@ already be available in the environment where a job runs.
 - Validates missing files, missing model patches, invalid schedules, finite
   strengths, and Canny threshold ranges before queueing work.
 
+## Qwen Image 2.1
+
+- Dedicated Qwen Image tab, `comfywrap qwen` command, and `generate_qwen()`
+  Python API for text-to-image and reference-image editing.
+- Bundled Q6 GGUF base, Qwen3-VL 8B W4A8 encoder, and native Qwen 2.1 VAE;
+  the graph builder also supports the standard UNET loader for safetensors.
+- Up to 10 ordered reference images, automatically uploaded for an edit.
+- Optional first-reference latent sizing, independent output width/height,
+  reference resize limit, and batch generation from the encoder latent.
+- Prompt/negative, seed, steps, CFG, sampler, scheduler, model-stack, and
+  filename-prefix controls.
+- Optional KV-cache device selection (`auto`, `gpu`, `cpu`, `off`) and dtype
+  (`default`, `int8`, `int4`).
+- Missing-image, mode, reference-count, and size validation before submission.
+- Dedicated controlled, consistent, outfit, and outpaint recipes are separate
+  panels under **Workflow tools**, described below.
+
 ## Combinator-style batch generation
 
 - Loads zone and prompt JSON from the wrapper or an external
@@ -219,6 +244,64 @@ already be available in the environment where a job runs.
 - Records video mode, recipe, references, seed, output files, loop errors,
   latent-upscale state, and RTX-VSR state in generation history.
 
+## Saved latents and video upscaling
+
+- H3 generation can save video and audio latent halves next to the delivered
+  clip. `video.save_latents` defaults to `true`; per-run CLI flags override it.
+- **Upscale from latents** tab and `comfywrap upscale` command accept saved
+  `.latent`/`.safetensors` files for a separate 3D upscale and decode-only pass.
+  This path does not run a sampler again.
+- Audio is decoded when the matching audio latent is supplied. CLI input can
+  resolve the sibling audio file; browser uploads must include both halves.
+  A video-only latent produces a silent output.
+- Rendered `.mp4`, `.webm`, `.mov`, or `.mkv` input uses the RTX VSR path.
+  Automatic mode selects the path from the extension; explicit `latent` and
+  `rtx` modes are also available.
+- VAE, audio VAE, upscaler model, scale, FPS, and RTX quality use `video.*`
+  configuration; the CLI accepts an explicit output path and audio latent.
+- The dedicated guided-upscale tool below performs a light redraw and is a
+  different workflow from saved-latent decoding or RTX VSR.
+
+## Dedicated workflow tools
+
+Each panel builds its own API graph and preset rather than using the global
+workflow/model selector. The existing configurable image and video tabs keep
+their own settings.
+
+| Panel | Implemented capability |
+| --- | --- |
+| H3 Memory saver video | Native FL2VA W4A8 sampling from a first frame and optional last frame, with H3 memory optimization. |
+| H3 Character swap LoRA | Ref2VA with a dedicated character-swap adapter and source-performance conditioning; optional Turbo 8-step adapter, adjustable swap strength, and explicit step override. |
+| H3 OmniChar video | `.char` package loading with up to four balanced references, available voice, and a compatible H3 adapter; falls back to references when an adapter is absent. |
+| H3 Guided clip upscale | Trim a finished clip, enlarge it with tiled latent upscaling and a light guided redraw, and retain source audio. |
+| Qwen Reference control | Up to three references with independent strength, phrase weighting, and an optional mask selecting details from a chosen reference. |
+| Qwen Consistent edit | A separate consistency adapter for small edits with adjustable strength. |
+| Qwen Outfit swap | A person image plus outfit reference, edit instruction, seed, and outfit-adapter strength. |
+| Qwen Outpaint | Left/top/right/bottom canvas extension with source-pixel restoration at the original size and position; grid padding and a 2 MP canvas limit. |
+| Keyframe animation | Local Wan 2.2 FLF2V for two to five consecutive pictures, per-pair movement/duration, AniSora high-noise and Lightx2v low-noise branches, and a joined 24 fps output. |
+
+- Clip tools normalize source trims to 24 fps and supported H3 frame counts.
+  Swap and guided-upscale delivery removes sampling padding and retains the
+  selected source audio.
+- Qwen reference masks control what the reference contributes; they do not
+  freeze output pixels. Outpaint restores source pixels with compositing.
+- OmniChar enforces the compatible-model and minimum-key-coverage checks;
+  foreign-model adapters are not applied to H3.
+- Preflight validates installed node schemas, required model choices, graph
+  links, socket types, uploaded inputs, and tool-specific input limits.
+- Panels share the wrapper's busy lock and refuse to queue behind an active
+  ComfyUI job. Tool cancellation targets its owned prompt.
+- Each run retains its media, actual API graph, result record, and generation
+  history under the configured local output tree.
+- Opt-in setup uses `configs/selected_workflows.assets.json`, pinned additive
+  node snapshots, and the specified OmniChar SDK. Model downloads resume,
+  verify publisher size/hash, check safetensors headers, and refuse to replace
+  mismatched existing files.
+- Export, live preflight, and model-header inspection scripts are provided.
+  These checks do not queue inference or establish visual quality.
+
+See [recipes, installation, and requirements](workflows/containers/README.md).
+
 ## WebUI
 
 - Optional Gradio WebUI (`python webui.py` or `comfywrap ui`) that resembles an
@@ -235,6 +318,10 @@ already be available in the environment where a job runs.
   start/end guides, character/head swaps, and text generation; still/last-frame
   uploads, reference image/video/audio uploads, H3 recipe selection, model
   stack selectors, auto-size, latent upscale, RTX-VSR, looping, and progress.
+- Upscale from latents tab for saved AV latent halves or a rendered clip.
+- Workflow tools tab with the nine dedicated H3, Qwen, and Wan panels above.
+- Voice Clone tab with reference recording/upload, exact transcript, clone
+  mode, language, sampling controls, playable output, and worker stop.
 - Batch tab with zone/prompt selectors, slot editor, LoRA filter, preview,
   prep, run, resume, existing job-file execution, and batch-specific settings.
 - History tab that browses recent locally saved images.
@@ -247,6 +334,8 @@ already be available in the environment where a job runs.
   metadata.
 - Configurable bind address, port, browser launch, and optional Gradio share
   tunnel.
+- `launch_tailscale.bat` starts the WebUI on port 8000 and prints the current
+  tailnet address, using the checkout's virtual environment or Python on PATH.
 
 ## Command-line interface
 
@@ -266,6 +355,8 @@ The installed `comfywrap` command and `python -m comfyui_wrapper` expose:
 | `interrupt` | Request interruption of the server's current job. |
 | `video` | Queue H3 frame animation, Ref2VA references/frame guides, swaps, or text generation. |
 | `qwen` | Queue Qwen Image 2.1 text-to-image or a reference-image edit. |
+| `upscale` | Upscale/decode a saved H3 latent or apply RTX VSR to a rendered clip. |
+| `tts` | Clone a voice locally with dots.tts-SOAR, or report installation status with `--check`. |
 | `ui` | Launch the optional Gradio WebUI. |
 
 Global CLI options can select a config file and override the ComfyUI host or
@@ -284,6 +375,24 @@ processing toggles.
 - `qwen_image_2_1.api.json` — Qwen Image 2.1 Q6 GGUF text-to-image. Edits add reference images at queue time.
 - `minimax_h3_i2v_loop.api.json` — MiniMax H3 I2V with native audio mux.
 - `minimax_h3_r2v_loop.api.json` — MiniMax H3 Ref2VA reference graph.
+- `minimax_h3_character_swap.api.json` — Ref2VA + Studio Turbo V4 + SAM3 character swap.
+- `minimax_h3_head_swap.api.json` — regular FL2VA with separate head-swap LoRA and compatible Acc.
+
+Dedicated tool graphs under `workflows/containers/`:
+
+- `h3_memory_i2v.api.json` — H3 memory saver video.
+- `h3_lora_swap.api.json` — dedicated character-swap LoRA, optional Turbo.
+- `h3_omnichar.api.json` — OmniChar references, voice, and compatible adapter.
+- `h3_guided_upscale.api.json` — tiled guided clip upscale with source audio.
+- `qwen_controlled.api.json` — reference influence, phrase weights, and optional mask.
+- `qwen_consistent.api.json` — small edits with the consistency adapter.
+- `qwen_outfit.api.json` — person/outfit reference swap.
+- `qwen_outpaint.api.json` — canvas extension and source-pixel restoration.
+- `wan_keyframes.api.json` — local Wan 2.2 keyframe transitions.
+
+`workflows/containers/upstream/` also preserves the original
+`comfy-cloud-animation5.api.json` and `comfy-cloud-animation5.ui.json` exports.
+The UI export is for the ComfyUI editor; the wrapper loads API graphs.
 
 Any additional ComfyUI API-format graph can be used by placing it under
 `workflows/`, selecting it in `config.yaml`, and checking `comfywrap bindings`.
@@ -309,12 +418,22 @@ This makes the wrapper usable as a library for custom runners while retaining
 the same configuration, graph patching, history, and output behavior as the
 CLI/WebUI paths.
 
+Additional module APIs expose the dedicated operations:
+
+```python
+from comfyui_wrapper.container_runner import run_container
+from comfyui_wrapper.tts import clone_voice
+from comfyui_wrapper.video import upscale_dropped_file
+```
+
 ## Operational boundaries
 
-- ComfyUI must be running and must have the custom nodes required by the
-  selected graph. Selecting a workflow does not install its dependencies.
+- ComfyUI image/video/upscale jobs need a running server with the nodes and
+  models required by the selected graph. Selecting a workflow does not install
+  its dependencies. Voice cloning uses its separate local runtime.
 - Model filenames in the example config are placeholders or expected local
-  assets; the wrapper does not fetch model weights.
+  assets. Generation does not fetch weights; the explicit workflow and voice
+  setup scripts can download their dependencies.
 - `--share` exposes the Gradio UI through Gradio's public tunnel and should be
   treated as an explicit network exposure choice.
 - `interrupt` affects the ComfyUI server's current job, which may belong to

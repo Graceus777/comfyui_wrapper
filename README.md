@@ -1,21 +1,49 @@
 # comfyui_wrapper
 
-Config-driven Python client for a running [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server.
+Config-driven CLI, Python client, and optional Gradio WebUI for
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI): image generation and
+editing, video, reusable workflow tools, and combinator batches. Voice cloning
+runs in a separate local dots.tts-SOAR worker.
 
 Ways in:
 
-1. **WebUI** — A1111-style Gradio app (`python webui.py`): SDXL, Anima, Krea 2, Flux GGUF, MiniMax H3 loops.
-2. **`generate`** — one still prompt, every sampler/size/checkpoint setting in `config.yaml`.
-3. **`video`** — MiniMax H3 image-to-video (same graph as `sd-comic-ext` ambient loops).
-4. **`prep` + `batch`** — combinator-style zone expansion.
+1. **WebUI** — A1111-style Gradio app (`python webui.py`) with image, video, upscale, workflow-tool, voice-clone, batch, and history tabs.
+2. **`generate`** — still images, img2img, inpainting, Hires. fix, ADetailer, and Anima controls.
+3. **`qwen`** — Qwen Image 2.1 text-to-image or edits with up to 10 reference images.
+4. **`video`** — MiniMax H3 frame animation, appearance references, frame-guided references, character/head swaps, and text-to-video.
+5. **`upscale`** — decode and upscale saved H3 latents, or apply RTX VSR to a finished clip.
+6. **`tts`** — clone a voice from a short reference recording with dots.tts-SOAR.
+7. **`preview` + `prep` + `batch`** — inspect, save, and run combinator-style zone expansion.
 
 Zone and prompt JSON from [sd-combinator-ext](https://github.com/Graceus777/sd-combinator-ext) load as-is. LoRAs are applied as ComfyUI `LoraLoader` nodes, not as `<lora:...>` tags in the prompt.
 
-For the complete capability inventory, see [FEATURES.md](FEATURES.md).
+## Feature overview
+
+| Area | Included features |
+| --- | --- |
+| Image generation | SDXL/Illustrious, Anima, Krea 2 Turbo, Flux GGUF, and Qwen Image 2.1; prompt, negative, model, sampler, scheduler, size, seed, and batch controls. |
+| Image editing | Img2img, drawn or uploaded inpaint masks, mask grow/blur/invert, Hires. fix with latent or pixel upscalers, and ADetailer face refinement. |
+| Extra networks | Multiple weighted LoRAs, activation text, A1111 prompt-tag parsing, model-only LoRAs, textual inversion, and hypernetwork prompt insertion. |
+| Anima controls | Stacked LLLite depth, pose, or lineart maps; per-control strength and timestep range; optional Canny preprocessing. |
+| Qwen Image | Text-to-image and edits with up to 10 references, first-reference sizing, custom output size, batch count, and KV-cache device/dtype controls. |
+| MiniMax H3 video | Still/start/end-frame animation, appearance/video/audio references, references plus frame guides, text-to-video, character swap, head swap, native audio, and compatible Acc/Turbo presets. |
+| Dedicated H3 tools | Memory saver video, character-swap LoRA with optional Turbo and step override, OmniChar `.char` references/voice/adapters, and guided clip upscale. |
+| Dedicated Qwen tools | Reference influence and phrase weights, reference masks, consistent edits, outfit swaps, and outpainting that restores the original source pixels. |
+| Wan keyframe animation | Two to five ordered keyframes, a movement prompt and duration for each adjacent pair, and one joined 24 fps clip. |
+| Video upscaling | Saved video/audio latents, a separate decode-only 3D upscale, RTX VSR for rendered clips, and optional cyclic loop blending. |
+| Voice cloning | dots.tts-SOAR Best match or Voice only, reference upload/microphone, language selection, NFE/CFG/seed controls, clip limit, WAV download, and worker cancellation. |
+| Batch generation | Always/loop/random LoRA zones, prompt-slot products, least-used ordering, editable job files, filtering, frozen random choices, skip-exists, resume, and cooldowns. |
+| Models and setup | ComfyUI/A1111 model discovery and sharing without copying weights; explicit setup scripts for workflow dependencies and the voice runtime. |
+| Operations | Queue/status/interrupt, progress with polling fallback, history/output browsing, graph bindings, custom API workflows, and resolved workflow dumps. |
+| Interfaces | Gradio WebUI, CLI, Python API, optional remote ComfyUI, and a Tailscale WebUI launcher. |
+
+For the detailed capability inventory and requirements, see [FEATURES.md](FEATURES.md).
 
 ## Setup
 
-ComfyUI must already be running (`http://127.0.0.1:8188` by default).
+Image, video, and upscale jobs need a running ComfyUI server
+(`http://127.0.0.1:8188` by default). Voice Clone uses its own local runtime;
+follow the separate [voice setup](docs/voice-clone.md).
 
 ```powershell
 git clone https://github.com/Graceus777/comfyui_wrapper.git
@@ -30,6 +58,9 @@ Edit `config.yaml`:
 
 - `comfyui.host` / `port`
 - `generation.*` — checkpoint, prompt, steps, cfg, sampler, size, seed
+- `video.*` — H3 workflows, frame/reference/swap settings, acceleration, saved latents, and upscaling
+- `qwen_image.*` — Qwen model stack, references, output size, sampler, and cache defaults
+- `voice_clone.*` — paths to the separate voice runtime and model package
 - `workflow.file` — API-format graph (export from ComfyUI with **File → Export (API)**)
 - `paths.combinator_root` — points at `sd-combinator-ext` so existing zone/prompt configs and `lora_texts/` resolve without copying
 - `paths.webui_root` — A1111 install (`…/sd.webui/webui`). Checkpoints, LoRAs, and VAE are used **from that folder**; nothing is copied into ComfyUI
@@ -43,9 +74,10 @@ python -m comfyui_wrapper bindings
 
 ## WebUI
 
-A1111-style Gradio interface: txt2img on the left, gallery + infotext on the right, extra-network LoRAs, combinator batch, and an outputs browser.
+A1111-style Gradio interface with prompt/gallery editing, Qwen Image, Video,
+Upscale from latents, Workflow tools, Voice Clone, Batch, and History tabs.
 
-ComfyUI must already be running.
+Install the optional WebUI dependencies:
 
 ```powershell
 python -m pip install -e ".[web]"
@@ -59,10 +91,21 @@ It starts the WebUI with `--listen` on port 8000 and prints your Tailscale URL.
 Connect Tailscale and start ComfyUI first, then keep the launcher's window open.
 The launcher uses `.venv` or `venv` when present, otherwise Python on your PATH.
 
-**Workflow tools** adds separate panels for H3 memory saver video, the dedicated
-character-swap LoRA, OmniChar, guided clip upscale, Qwen 2.1 reference control,
-consistent edits, outfit swaps, outpainting, and local Wan keyframe animation.
-Each runs its own preset. See [setup, recipes and verification](workflows/containers/README.md).
+**Workflow tools** runs a dedicated graph and preset for each panel:
+
+| Panel | What it does |
+| --- | --- |
+| H3 Memory saver video | Animate a first frame, optionally with a last frame, using native sampling and memory optimization. |
+| H3 Character swap LoRA | Replace one person in a source clip using the dedicated swap adapter; optional Turbo 8-step and sampling-step override. |
+| H3 OmniChar video | Generate from a `.char` package using its references, available voice, and compatible H3 character adapter. |
+| H3 Guided clip upscale | Enlarge a finished clip with a light guided redraw while retaining source audio. |
+| Qwen Reference control | Edit with up to three references, independent influence, phrase weights, and an optional reference-detail mask. |
+| Qwen Consistent edit | Apply a small edit using the consistency adapter. |
+| Qwen Outfit swap | Use a person's picture and an outfit reference with the outfit adapter. |
+| Qwen Outpaint | Extend any side of the canvas and restore the source picture at its original size and position. |
+| Keyframe animation | Join local Wan 2.2 transitions between two to five ordered pictures. |
+
+See [setup, recipes and requirements](workflows/containers/README.md).
 
 **Voice Clone** uses local dots.tts-SOAR with a 3–10 second reference recording.
 Choose **Best match**, enter the exact reference transcript, and enter the new
@@ -79,7 +122,9 @@ its separate worker releases GPU memory after each job. Setup and CLI usage:
 | `--host` / `--comfy-port` | Override the ComfyUI server from `config.yaml` |
 
 - **txt2img** — prompt / negative, sampling, size, seed, batch count, **img2img**, **Inpaint**, **Hires. fix**, **Anima LLLite control**, and **ADetailer**. The img2img tab takes an init image (resized to Width x Height, VAE-encoded into the first KSampler; denoise is the strength) and works on SDXL, Anima, Krea 2, and Flux GGUF. The Inpaint tab is A1111-style: drop the init image, paint the mask with the brush (white = repaint), tune denoise / mask expand / mask blur / invert; a mask upload overrides the drawing. Inpaint uses whole-picture `SetLatentNoiseMask`, so no inpaint model is needed. The Anima section accepts a preprocessed depth, pose, or lineart image plus a model patch, strength, and timestep schedule. Extra networks cover LoRA (`<lora:name:weight>` → ComfyUI LoRA nodes), textual inversion (`embedding:name` from A1111 `embeddings/`), and hypernetworks. Checkpoints, LoRAs, VAE, embeddings, and ControlNet are used from `paths.webui_root` without copying.
-- **Qwen Image** — Qwen Image 2.1 text-to-image and reference-image edits on the Q6 graph (`qwen_image_2.1-Q6_K.gguf`, `qwen3vl_8b_w4a8.safetensors`, `qwen_image_2.1_vae_bf16.safetensors`). Text-to-image uses Width × Height. Image edit sends up to 10 references into `TextEncodeQwenImage21`; **Match first image** samples at that image's size. Start ComfyUI with `run_qwen_image_2_1_q6_lowvram.bat` on a 12 GB GPU. CLI: `comfywrap qwen --prompt "..."` or `comfywrap qwen --image ref.png --prompt "wear the blue shirt"`.
+- **Qwen Image** — Qwen Image 2.1 text-to-image and reference-image edits on the Q6 graph (`qwen_image_2.1-Q6_K.gguf`, `qwen3vl_8b_w4a8.safetensors`, `qwen_image_2.1_vae_bf16.safetensors`). Text-to-image uses Width × Height. Image edit accepts up to 10 references; **Match first image** samples at that image's size. Install the matching ComfyUI nodes and models before use. CLI: `comfywrap qwen --prompt "..."` or `comfywrap qwen --image ref.png --prompt "wear the blue shirt"`.
+- **Video** — H3 frame animation, appearance references, references plus start/end guides, character/head swaps, and text-to-video. Includes source trimming, separate appearance and scene prompts, native audio, optional looping, saved AV latents, and upscaling controls.
+- **Upscale from latents** — upload the saved video and audio latent halves for a decode-only 3D upscale, or a rendered clip for RTX VSR. Upload both latent halves to retain audio; a video-only latent produces a silent clip.
 - **Batch** — combinator zone + prompt config, plus its own steps / CFG / resolution / sampler, and ADetailer. Preview / Prep / Run, or run an existing `configs/jobs/*.json` file.
 - **History** — recent files in `paths.output`.
 
@@ -160,6 +205,10 @@ Skip-exists uses `generation_history.jsonl` (same idea as the extension). Loop o
 | Command | Purpose |
 |---------|---------|
 | `generate` | One prompt |
+| `qwen` | Qwen Image 2.1 text-to-image or reference-image edit |
+| `video` | H3 frame animation, appearance/frame-guided references, character/head swaps, or text-to-video |
+| `upscale` | Decode/upscale saved H3 latents, or apply RTX VSR to a rendered clip |
+| `tts` | Clone a voice locally with dots.tts-SOAR; `--check` reports setup status |
 | `preview` | Print expanded jobs |
 | `prep` | Write `configs/jobs/*.json` |
 | `batch` | Run a job file, or `--zone` to prep+run |
@@ -168,7 +217,6 @@ Skip-exists uses `generation_history.jsonl` (same idea as the extension). Loop o
 | `bindings` | Show which graph nodes map to prompt/seed/size/... |
 | `status` / `interrupt` | Queue / stop |
 | `ui` | A1111-style Gradio WebUI |
-| `video` | MiniMax H3 I2V loop (`--image still.png`) |
 
 `comfywrap` is installed as a console script if you used `pip install -e .`.
 
@@ -176,13 +224,32 @@ Skip-exists uses `generation_history.jsonl` (same idea as the extension). Loop o
 
 Bundled graphs under `workflows/`:
 
-| File | Stack |
-|------|--------|
-| `sdxl_txt2img.api.json` | Illustrious / SDXL checkpoint |
-| `anima_txt2img.api.json` | Anima UNET + Qwen3 0.6B CLIP (`qwen_3_06b_base.safetensors`) + `qwen_image_vae.safetensors` |
-| `krea2_txt2img.api.json` | Krea 2 Turbo UNET + Qwen CLIP |
-| `flux_gguf_txt2img.api.json` | Flux dev GGUF + Dual CLIP + `ae.safetensors` |
-| `minimax_h3_i2v_loop.api.json` | MiniMax H3 I2V + native audio mux (ambient loop) |
+| File | Stack / purpose |
+| --- | --- |
+| [`sdxl_txt2img.api.json`](workflows/sdxl_txt2img.api.json) | Illustrious / SDXL checkpoint. |
+| [`anima_txt2img.api.json`](workflows/anima_txt2img.api.json) | Anima UNET + Qwen3 0.6B CLIP + Qwen image VAE. |
+| [`krea2_txt2img.api.json`](workflows/krea2_txt2img.api.json) | Krea 2 Turbo UNET + Qwen CLIP. |
+| [`flux_gguf_txt2img.api.json`](workflows/flux_gguf_txt2img.api.json) | Flux dev GGUF + Dual CLIP + `ae.safetensors`. |
+| [`qwen_image_2_1.api.json`](workflows/qwen_image_2_1.api.json) | Qwen Image 2.1 Q6 text-to-image; reference-edit inputs are added at run time. |
+| [`minimax_h3_i2v_loop.api.json`](workflows/minimax_h3_i2v_loop.api.json) | H3 FL2VA frame animation with native audio. |
+| [`minimax_h3_r2v_loop.api.json`](workflows/minimax_h3_r2v_loop.api.json) | H3 Ref2VA appearance/video/audio references; optional frame guides are added at run time. |
+| [`minimax_h3_character_swap.api.json`](workflows/minimax_h3_character_swap.api.json) | Ref2VA + Studio Turbo V4 + SAM3 character replacement. |
+| [`minimax_h3_head_swap.api.json`](workflows/minimax_h3_head_swap.api.json) | Regular FL2VA + separate head-swap LoRA + compatible Acc. |
+| [`containers/h3_memory_i2v.api.json`](workflows/containers/h3_memory_i2v.api.json) | H3 native memory saver frame animation. |
+| [`containers/h3_lora_swap.api.json`](workflows/containers/h3_lora_swap.api.json) | Dedicated Ref2VA character-swap LoRA with optional Turbo. |
+| [`containers/h3_omnichar.api.json`](workflows/containers/h3_omnichar.api.json) | OmniChar references, optional voice, and compatible H3 adapter. |
+| [`containers/h3_guided_upscale.api.json`](workflows/containers/h3_guided_upscale.api.json) | Guided clip upscale with light redraw and source audio. |
+| [`containers/qwen_controlled.api.json`](workflows/containers/qwen_controlled.api.json) | Qwen reference strength, phrase weights, and optional mask. |
+| [`containers/qwen_consistent.api.json`](workflows/containers/qwen_consistent.api.json) | Qwen consistency adapter for small edits. |
+| [`containers/qwen_outfit.api.json`](workflows/containers/qwen_outfit.api.json) | Qwen person/outfit reference swap. |
+| [`containers/qwen_outpaint.api.json`](workflows/containers/qwen_outpaint.api.json) | Qwen canvas extension with source-pixel restoration. |
+| [`containers/wan_keyframes.api.json`](workflows/containers/wan_keyframes.api.json) | Wan 2.2 FLF2V with AniSora and Lightx2v transition branches. |
+
+The original Comfy Cloud keyframe export is also included as an
+[API graph](workflows/containers/upstream/comfy-cloud-animation5.api.json) and
+[UI graph](workflows/containers/upstream/comfy-cloud-animation5.ui.json).
+The UI export is a reference for the ComfyUI editor; the wrapper loads API
+graphs. Dedicated tools build the matching graph with the supplied inputs.
 
 Pick the workflow in the WebUI; model / CLIP / VAE dropdowns list ComfyUI `checkpoints`, `diffusion_models`, `unet` (GGUF), `text_encoders`, and `vae`.
 
@@ -292,6 +359,26 @@ comfywrap video --mode charswap --image character.png --ref-video source.mp4 --s
 This matches the reference-based [Studio workflow](https://github.com/BiggerFishy/comfyui-minimax-h3-studio).
 Visual identity and motion adherence remain subject to generation quality.
 
+## Saved latents and video upscaling
+
+The Video tab can save both video and audio latents next to a generated clip.
+`video.save_latents` defaults to `true`; `comfywrap video --no-save-latents`
+disables it for one run. The **Upscale from latents** tab loads these saved
+halves for a separate 3D upscale and decode without running the sampler again.
+Upload both halves to keep audio. On the CLI, the matching audio sibling is
+found automatically, or can be selected with `--audio-latent`.
+
+```powershell
+comfywrap upscale saved_video.latent --out larger.mp4
+comfywrap upscale saved_video.latent --audio-latent saved_audio.latent --out larger.mp4
+comfywrap upscale finished.mp4 --mode rtx --out finished-upscaled.mp4
+```
+
+`auto` selects latent upscaling or RTX VSR from the file extension. The model,
+VAE, scale, FPS, and RTX quality come from `video.*` settings. These paths
+differ from **H3 Guided clip upscale**, which enlarges a source clip with a
+light redraw. Loop blending is an optional separate ffmpeg pass.
+
 ## Config map
 
 | Key | Role |
@@ -299,6 +386,12 @@ Visual identity and motion adherence remain subject to generation quality.
 | `comfyui.*` | Host, port, timeouts |
 | `generation.*` | Prompt, checkpoint, sampler, size, seed, default LoRAs |
 | `generation.lora_mode` | `full` (MODEL+CLIP) or `model_only` |
+| `generation.inpaint` | Mask, denoise, grow, blur, and invert |
+| `generation.anima_lllite` | Ordered controls, preprocessing, strengths, and timestep ranges |
+| `video.*` | H3 workflow/model stack, references, swaps, frame count, audio, recipes, looping, and upscale settings |
+| `video.save_latents` | Retain the generated video/audio latent halves for later decoding/upscaling |
+| `qwen_image.*` | Qwen workflow/model stack, output/reference sizing, sampling, and KV-cache defaults |
+| `voice_clone.python` / `voice_clone.model_dir` | Separate SOAR runtime and model package paths |
 | `batch.skip_exists` | Drop jobs whose hash is already in history |
 | `batch.sample_random_at` | `prep` freezes random-zone picks into the job file |
 | `batch.save_locally` | Copy ComfyUI outputs into `paths.output` |
@@ -314,10 +407,11 @@ python -m pytest -q
 ```
 
 The test suite covers CLI/config parsing, model resolution, workflow binding
-and graph injection, H3 video graph wiring, batch preparation, and WebUI
-construction. A live GPU render still depends on the installed ComfyUI nodes
-and model files; see [FEATURES.md](FEATURES.md) for those operational
-boundaries.
+and graph injection, Qwen edits, H3 references and swaps, source timing/audio,
+dedicated workflow recipes and preflight, voice-worker requests/cancellation,
+batch preparation, and WebUI construction. A live GPU render still depends
+on the installed ComfyUI nodes and model files; see [FEATURES.md](FEATURES.md)
+for those operational boundaries.
 
 ## First-run checks and recovery
 
